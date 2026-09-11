@@ -844,6 +844,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn save_guard_prompts_only_when_a_retarget_would_destroy_queued_work() {
+        // Retarget, queued work, no acknowledgement yet: refuse and report.
+        assert!(matches!(
+            save_guard(true, false, 3),
+            Some(SaveOutcome::NeedsConfirm { pending_count: 3 })
+        ));
+        // Acknowledged: the caller has been told, let it through.
+        assert!(save_guard(true, true, 3).is_none());
+        // Retarget with an empty queue: nothing is at risk, never prompt.
+        assert!(save_guard(true, false, 0).is_none());
+        // Same target -- a password-only edit, say. reset_cache won't run, so
+        // however deep the queue is it is not at risk and must not nag.
+        assert!(save_guard(false, false, 42).is_none());
+    }
+
     fn cfg(base_url: &str, calendar: Option<&str>) -> config::Config {
         config::Config {
             active_list: None,
@@ -2124,14 +2140,46 @@ fn format_discover_error(err: &anyhow::Error) -> String {
 /// MSG_SAVE_CONFIG handler. Writes the new config (blank password keeps the
 /// existing one) and resets the cache only when the target changed. Returns
 /// `{ok: true}` or `{ok: false, error}`.
+/// Outcome of a Settings save.
+///
+/// Changing the collection calls `reset_cache`, whose first statement deletes
+/// every `pending_op` row -- so an otherwise ordinary save can silently destroy
+/// queued offline edits. When there is queued work, the save is refused and the
+/// UI is told what it would cost; it re-sends with `discard_pending` once the
+/// user has acknowledged it.
+enum SaveOutcome {
+    Saved,
+    NeedsConfirm { pending_count: i64 },
+}
+
 fn save_config(db: &mut Connection, payload: &str) -> String {
     match save_config_inner(db, payload) {
-        Ok(()) => serde_json::json!({ "ok": true }).to_string(),
+        Ok(SaveOutcome::Saved) => serde_json::json!({ "ok": true }).to_string(),
+        Ok(SaveOutcome::NeedsConfirm { pending_count }) => serde_json::json!({
+            "ok": false,
+            "needs_confirm": true,
+            "pending_count": pending_count,
+        })
+        .to_string(),
         Err(e) => serde_json::json!({ "ok": false, "error": format!("{e:#}") }).to_string(),
     }
 }
 
-fn save_config_inner(db: &mut Connection, payload: &str) -> anyhow::Result<()> {
+/// Decide whether a save may proceed, given whether it retargets the account,
+/// whether the user has acknowledged the loss, and how much is queued.
+///
+/// Kept separate from the I/O so the truth table is testable. The case worth
+/// naming: an unchanged target never prompts, however deep the queue is, so
+/// updating only a password doesn't nag about work that isn't at risk.
+fn save_guard(changed: bool, discard_ack: bool, pending_count: i64) -> Option<SaveOutcome> {
+    if changed && !discard_ack && pending_count > 0 {
+        Some(SaveOutcome::NeedsConfirm { pending_count })
+    } else {
+        None
+    }
+}
+
+fn save_config_inner(db: &mut Connection, payload: &str) -> anyhow::Result<SaveOutcome> {
     let v: serde_json::Value = serde_json::from_str(payload)?;
     let provider = v
         .get("provider")
@@ -2185,6 +2233,15 @@ fn save_config_inner(db: &mut Connection, payload: &str) -> anyhow::Result<()> {
         anyhow::bail!("an app password is required when the CalDAV account changes");
     }
     let changed = target_changed(old.as_ref(), &base_url, &calendar_href);
+    let discard_ack = v
+        .get("discard_pending")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    // Refuse before writing anything: a refused save must leave the config and
+    // the queue exactly as they were.
+    if let Some(outcome) = save_guard(changed, discard_ack, db::count_pending_ops(db)?) {
+        return Ok(outcome);
+    }
     let active_list = v
         .get("active_list")
         .and_then(|x| x.as_str())
@@ -2209,7 +2266,7 @@ fn save_config_inner(db: &mut Connection, payload: &str) -> anyhow::Result<()> {
     if changed {
         db::reset_cache(db)?;
     }
-    Ok(())
+    Ok(SaveOutcome::Saved)
 }
 
 /// MSG_DISCOVER_WITH handler. Validates the provided credentials by listing the

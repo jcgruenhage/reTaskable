@@ -64,6 +64,11 @@ Rectangle {
     // calendar discovery — Save is blocked until the user re-Tests, so we never
     // persist a calendar that doesn't exist on the (new) server.
     property bool needsDiscover: false
+    // Changing the collection wipes the offline queue, so the backend refuses
+    // the first save and reports what would be lost. Armed until the user
+    // either confirms the loss or backs out.
+    property bool settingsDiscardArmed: false
+    property int settingsPendingCount: 0
     property bool createReady: false
 
     // M10: the task list is a structured ListModel populated from the JSON
@@ -252,6 +257,8 @@ Rectangle {
     // ---- M11: settings flow ----
     function openSettings() {
         root.settingsOpen = true
+        root.settingsDiscardArmed = false
+        root.settingsPendingCount = 0
         settingsStatus.text = ""
         syncErrorsStatus.text = ""
         calendarsModel.clear()
@@ -333,7 +340,9 @@ Rectangle {
                                      : "Pick one, then Save.")
     }
 
-    function saveSettings() {
+    // `discardPending` is only ever true on the second, deliberate tap: the
+    // plain Save button never sends it, so no ordinary save can destroy the queue.
+    function saveSettings(discardPending) {
         settingsStatus.text = "Saving…"
         endpoint.sendMessage(16, JSON.stringify({
             provider: root.settingsProvider,
@@ -342,7 +351,8 @@ Rectangle {
             app_password: settingsPass.text,
             calendar: root.selectedCalendar,
             calendar_href: root.selectedCalendarHref,
-            active_list: root.selectedCalendarHref
+            active_list: root.selectedCalendarHref,
+            discard_pending: discardPending === true
         }))
     }
 
@@ -354,10 +364,19 @@ Rectangle {
             settingsStatus.text = jsonText
             return
         }
+        if (r.needs_confirm === true) {
+            root.settingsPendingCount = r.pending_count ? r.pending_count : 0
+            root.settingsDiscardArmed = true
+            settingsStatus.text = "Changing the task list discards "
+                + root.settingsPendingCount
+                + " change(s) that haven't reached the server yet. Nothing has been saved."
+            return
+        }
         if (!r.ok) {
             settingsStatus.text = "Error: " + (r.error ? r.error : "save failed")
             return
         }
+        root.settingsDiscardArmed = false
         root.settingsOpen = false
         root.createReady = false
         statusText.text = "Settings saved. Syncing…"
@@ -1491,6 +1510,58 @@ Rectangle {
                     MouseArea {
                         anchors.fill: parent
                         onClicked: root.settingsOpen = false
+                    }
+                }
+            }
+
+            // Two-step confirm, mirroring the task-delete idiom: the ordinary
+            // Save above is never destructive, and only this button -- which
+            // exists only after the backend has said what would be lost --
+            // carries the discard flag.
+            Row {
+                visible: root.settingsDiscardArmed
+                spacing: 16
+
+                Rectangle {
+                    width: 340
+                    height: 72
+                    color: "white"
+                    border.color: "#c0392b"
+                    border.width: 3
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Discard " + root.settingsPendingCount + " and save"
+                        font.pixelSize: 22
+                        color: "#c0392b"
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: root.saveSettings(true)
+                    }
+                }
+
+                Rectangle {
+                    width: 240
+                    height: 72
+                    color: "white"
+                    border.color: "black"
+                    border.width: 3
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Keep them"
+                        font.pixelSize: 22
+                        color: "black"
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            root.settingsDiscardArmed = false
+                            settingsStatus.text = "Kept. Tap Sync to send them, then change the list."
+                        }
                     }
                 }
             }

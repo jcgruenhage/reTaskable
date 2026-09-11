@@ -1054,6 +1054,16 @@ pub fn count_resolvable_conflicts(conn: &Connection) -> Result<i64> {
     Ok(n)
 }
 
+/// Total queued operations, errored or not.
+///
+/// Distinct from [`count_resolvable_conflicts`], which counts only the subset a
+/// user can act on: this counts everything the queue still owes the server,
+/// because `reset_cache` destroys all of it indiscriminately.
+pub fn count_pending_ops(conn: &Connection) -> Result<i64> {
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0))?;
+    Ok(n)
+}
+
 /// Look up a single pending_op row by id. Used by the M9b conflict
 /// resolution path to verify an op is still resolvable between the user's
 /// "Resolve" tap and their "Keep Mine" / "Take Theirs" tap (the op could
@@ -2768,6 +2778,23 @@ mod tests {
             [],
         ).unwrap();
         assert!(first_resolvable_conflict(&conn).unwrap().is_none());
+    }
+
+    #[test]
+    fn count_pending_ops_counts_errored_and_clean_alike() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        assert_eq!(count_pending_ops(&conn).unwrap(), 0);
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at, errored, last_error)
+             VALUES ('toggle', 'a', '/cal/', NULL, 100, 0, NULL),
+                    ('edit',   'b', '/cal/', NULL, 101, 1, 'HTTP 401 Unauthorized')",
+            [],
+        )
+        .unwrap();
+        // reset_cache deletes both regardless of state, so both are at risk and
+        // both have to be reported.
+        assert_eq!(count_pending_ops(&conn).unwrap(), 2);
     }
 
     #[test]
