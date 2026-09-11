@@ -26,6 +26,7 @@ Rectangle {
     property bool showCompleted: false
     property string viewDue: ""
     property string viewDueOn: ""
+    property string viewQuery: ""
     property bool viewFiltered: false
 
     // M14 UX: number of conflict-resolvable errored ops, from the MSG 104
@@ -202,12 +203,21 @@ Rectangle {
     }
 
     function clearFilters() {
-        root.setView({ due: "", due_on: "" })
+        searchInput.text = ""
+        root.setView({ due: "", due_on: "", query: "" })
     }
 
     // Human-readable description of what is currently hiding tasks, for the
     // header indicator. Empty when nothing is.
     function filterLabel() {
+        var parts = []
+        if (root.viewQuery.length > 0) parts.push("\"" + root.viewQuery + "\"")
+        var dueLabel = root.dueFilterLabel()
+        if (dueLabel.length > 0) parts.push(dueLabel)
+        return parts.join(" + ")
+    }
+
+    function dueFilterLabel() {
         if (root.viewDueOn.length > 0) return "due " + root.formatDue(root.viewDueOn)
         if (root.viewDue === "overdue") return "overdue"
         if (root.viewDue === "today") return "due today"
@@ -496,7 +506,13 @@ Rectangle {
         root.showCompleted = view.include_completed === true
         root.viewDue = view.due ? view.due : ""
         root.viewDueOn = view.due_on ? view.due_on : ""
+        root.viewQuery = view.query ? view.query : ""
         root.viewFiltered = view.filtered === true
+        // Only correct the field when it has genuinely drifted, so a refresh
+        // arriving mid-edit doesn't overwrite what is being typed.
+        if (searchInput.text !== root.viewQuery) {
+            searchInput.text = root.viewQuery
+        }
         taskList.contentY = 0
         var synced = data.last_synced ? data.last_synced : "Not yet synced — tap Sync."
         statusText.text = synced + "   (" + tasks.length + (root.showCompleted ? " shown, incl. completed)" : " open)")
@@ -983,6 +999,50 @@ Rectangle {
                 MouseArea {
                     anchors.fill: parent
                     onClicked: root.clearFilters()
+                }
+            }
+        }
+
+        // Search is submit-based, never live. Filtering per keystroke would
+        // repaint the whole list on every character, and on e-ink that is the
+        // one thing the UI cannot afford -- the rest of this screen is built
+        // around making each redraw a deliberate, single event.
+        Row {
+            width: parent.width
+            spacing: 12
+
+            TextField {
+                id: searchInput
+                width: parent.width - searchBtn.width - 12
+                height: 60
+                font.pixelSize: 22
+                color: "black"
+                placeholderTextColor: "#505050"
+                placeholderText: "Search summaries and note sources"
+                onAccepted: root.setView({ query: searchInput.text })
+            }
+
+            Rectangle {
+                id: searchBtn
+                width: 160
+                height: 60
+                color: "white"
+                border.color: "black"
+                border.width: 3
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "Search"
+                    font.pixelSize: 22
+                    color: "black"
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        Qt.inputMethod.hide()
+                        root.setView({ query: searchInput.text })
+                    }
                 }
             }
         }

@@ -521,9 +521,11 @@ fn show_tasks(db: &mut Connection) -> anyhow::Result<String> {
     let view = config::load_optional()?.map(|c| c.view).unwrap_or_default();
 
     let tasks = db::list_tasks(db, &cal_href)?;
-    let tasks = view::apply(tasks, &view, &view::today_token());
     let marks = db::pending_marks(db, &cal_href)?;
     let sources = db::source_labels(db, &cal_href)?;
+    // Filtering happens after the source labels are loaded, because the query
+    // matches against them too -- they are text the row displays.
+    let tasks = view::apply(tasks, &view, &view::today_token(), &sources);
     let anchors = db::source_anchors(db, &cal_href)?;
     let last_synced = if db::is_local_list(&cal_href) {
         Some("Stored on this reMarkable.".to_string())
@@ -552,6 +554,9 @@ fn set_view(payload: &str) -> anyhow::Result<String> {
     let mut cfg = config::load()?;
     if let Some(include) = v.get("include_completed").and_then(|x| x.as_bool()) {
         cfg.view.include_completed = include;
+    }
+    if let Some(query) = v.get("query").and_then(|x| x.as_str()) {
+        cfg.view.query = query.trim().to_string();
     }
     let due = v.get("due").and_then(|x| x.as_str()).map(str::trim);
     let due_on = v.get("due_on").and_then(|x| x.as_str()).map(str::trim);

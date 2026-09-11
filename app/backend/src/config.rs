@@ -52,6 +52,10 @@ pub struct ViewConfig {
     /// Mutually exclusive with `due`; the setter clears whichever is not chosen.
     #[serde(default)]
     pub due_on: String,
+    /// Free-text search. Matched against the text the list actually shows, so a
+    /// task never matches on something the user cannot see.
+    #[serde(default)]
+    pub query: String,
 }
 
 impl ViewConfig {
@@ -60,7 +64,7 @@ impl ViewConfig {
     /// `include_completed` is excluded on purpose: it only ever makes the list
     /// longer, and warning someone that they can see more would be noise.
     pub fn is_filtered(&self) -> bool {
-        !self.due.is_empty() || !self.due_on.is_empty()
+        !self.due.is_empty() || !self.due_on.is_empty() || !self.query.trim().is_empty()
     }
 }
 

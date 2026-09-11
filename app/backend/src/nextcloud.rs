@@ -1449,6 +1449,7 @@ pub fn format_tasks_json(
             "include_completed": view.include_completed,
             "due": view.due,
             "due_on": view.due_on,
+            "query": view.query,
             "filtered": view.is_filtered(),
         },
     })
