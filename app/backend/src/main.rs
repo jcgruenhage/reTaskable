@@ -42,6 +42,7 @@ const MSG_SELECT_SOURCE: u32 = 23;
 const MSG_TRANSFER_TASK: u32 = 24;
 const MSG_GET_DIAGNOSTICS: u32 = 25;
 const MSG_SET_VIEW: u32 = 26;
+const MSG_SET_TARGET: u32 = 27;
 const MSG_PONG: u32 = 101;
 const MSG_NEXTCLOUD_RESPONSE: u32 = 102;
 const MSG_CALENDARS_RESPONSE: u32 = 103;
@@ -68,6 +69,7 @@ const MSG_SELECT_SOURCE_RESPONSE: u32 = 123;
 const MSG_TRANSFER_TASK_RESPONSE: u32 = 124;
 const MSG_GET_DIAGNOSTICS_RESPONSE: u32 = 125;
 const MSG_SET_VIEW_RESPONSE: u32 = 126;
+const MSG_SET_TARGET_RESPONSE: u32 = 127;
 
 #[tokio::main]
 async fn main() {
@@ -407,6 +409,14 @@ impl AppLoadBackend for Backend {
                 };
                 send(replier, MSG_SET_VIEW_RESPONSE, &response);
             }
+            MSG_SET_TARGET => {
+                eprintln!("retaskable: set create target {}", msg.contents);
+                let response = match set_target(&self.db, &msg.contents) {
+                    Ok(s) => s,
+                    Err(e) => format!("error: {e:#}"),
+                };
+                send(replier, MSG_SET_TARGET_RESPONSE, &response);
+            }
             MSG_GET_DIAGNOSTICS => {
                 send(
                     replier,
@@ -443,6 +453,7 @@ fn list_sources(db: &Connection) -> anyhow::Result<String> {
         "sources": db::list_calendars(db)?,
         "color": display.color,
         "device": display.model,
+        "default_target": config::default_target(&config::load_optional()?.unwrap_or_default()),
     })
     .to_string())
 }
@@ -516,19 +527,63 @@ fn active_list_href(db: &Connection) -> anyhow::Result<String> {
     Ok(config::LOCAL_LIST_ID.to_string())
 }
 
-fn show_tasks(db: &mut Connection) -> anyhow::Result<String> {
-    let cal_href = active_list_href(db)?;
-    let view = config::load_optional()?.map(|c| c.view).unwrap_or_default();
+/// The collection a per-task operation must act on.
+///
+/// Resolved from the task's own cache row, not from the selected list: those
+/// coincide only while a single list is visible at a time. Falls back to the
+/// selected list when the UID is not cached at all, so the caller still fails
+/// with its own "no task with uid ..." message rather than a vaguer one here.
+fn collection_for_uid(db: &Connection, uid: &str) -> anyhow::Result<String> {
+    match db::find_collection_for_uid(db, uid)? {
+        Some(href) => Ok(href),
+        None => active_list_href(db),
+    }
+}
 
-    let tasks = db::list_tasks(db, &cal_href)?;
-    let tasks = view::apply(tasks, &view, &view::today_token());
-    let marks = db::pending_marks(db, &cal_href)?;
-    let sources = db::source_labels(db, &cal_href)?;
-    let anchors = db::source_anchors(db, &cal_href)?;
-    let last_synced = if db::is_local_list(&cal_href) {
-        Some("Stored on this reMarkable.".to_string())
+/// Build the merged task list.
+///
+/// Every collection is queried and the results are shown together; narrowing to
+/// one is a filter, not a mode. The per-collection helpers are reused as-is and
+/// their results merged, which keeps the single-collection semantics (marks,
+/// note anchors, sync times) intact rather than reimplementing them across a
+/// join.
+fn show_tasks(db: &mut Connection) -> anyhow::Result<String> {
+    db::ensure_local_list(db)?;
+    let view = config::load_optional()?.map(|c| c.view).unwrap_or_default();
+    let today = view::today_token();
+
+    let mut tasks = Vec::new();
+    let mut marks = std::collections::HashMap::new();
+    let mut sources = std::collections::HashMap::new();
+    let mut anchors = std::collections::HashMap::new();
+    let mut collections = std::collections::HashMap::new();
+    let mut synced_lines: Vec<String> = Vec::new();
+
+    for list in db::list_calendars(db)? {
+        if !view::collection_matches(&list.id, &view.collections) {
+            continue;
+        }
+        let listed = view::apply(db::list_tasks(db, &list.id)?, &view, &today);
+        for task in &listed {
+            collections.insert(task.uid.clone(), list.clone());
+        }
+        tasks.extend(listed);
+        marks.extend(db::pending_marks(db, &list.id)?);
+        sources.extend(db::source_labels(db, &list.id)?);
+        anchors.extend(db::source_anchors(db, &list.id)?);
+
+        if db::is_local_list(&list.id) {
+            continue;
+        }
+        if let Some(when) = db::last_synced(db, &list.id)? {
+            synced_lines.push(format!("{} {} ago", list.display_name, humanize_since(when)));
+        }
+    }
+
+    let last_synced = if synced_lines.is_empty() {
+        None
     } else {
-        db::last_synced(db, &cal_href)?.map(|t| format!("Last synced {} ago.", humanize_since(t)))
+        Some(format!("Synced: {}.", synced_lines.join(", ")))
     };
     let conflicts = db::count_resolvable_conflicts(db)?;
     Ok(nextcloud::format_tasks_json(
@@ -539,7 +594,26 @@ fn show_tasks(db: &mut Connection) -> anyhow::Result<String> {
         last_synced.as_deref(),
         conflicts,
         &view,
+        &collections,
     ))
+}
+
+/// MSG_SET_TARGET handler. Persists which collection new tasks are created in.
+///
+/// Validated against the cache rather than accepted blindly: a target that no
+/// longer exists would silently strand every task created afterwards.
+fn set_target(db: &Connection, target: &str) -> anyhow::Result<String> {
+    let target = target.trim();
+    if target.is_empty() {
+        anyhow::bail!("a target collection is required");
+    }
+    if !db::is_local_list(target) && !db::calendar_exists(db, target)? {
+        anyhow::bail!("unknown task list");
+    }
+    let mut cfg = config::load()?;
+    cfg.lists.default_target = Some(target.to_string());
+    config::save(&cfg)?;
+    Ok(serde_json::json!({ "ok": true, "target": target }).to_string())
 }
 
 /// MSG_SET_VIEW handler. Persists the filter state the UI just changed.
@@ -555,6 +629,15 @@ fn set_view(payload: &str) -> anyhow::Result<String> {
     }
     // Absent means "leave alone"; present-but-empty means "clear". That
     // distinction is what lets the UI set one axis without disturbing another.
+    if let Some(collections) = v.get("collections").and_then(|x| x.as_array()) {
+        cfg.view.collections = collections
+            .iter()
+            .filter_map(|c| c.as_str())
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
     if let Some(tags) = v.get("tags").and_then(|x| x.as_array()) {
         cfg.view.tags = tags
             .iter()
@@ -1933,7 +2016,7 @@ fn toggle_by_uid(db: &mut Connection, uid: &str) -> anyhow::Result<String> {
         anyhow::bail!("uid cannot be empty");
     }
 
-    let cal_href = active_list_href(db)?;
+    let cal_href = collection_for_uid(db, uid)?;
 
     toggle_by_uid_inner(db, &cal_href, uid)
 }
@@ -1989,7 +2072,7 @@ fn edit_by_uid(db: &mut Connection, payload: &str) -> anyhow::Result<String> {
         anyhow::bail!("summary cannot be empty");
     }
 
-    let cal_href = active_list_href(db)?;
+    let cal_href = collection_for_uid(db, uid)?;
 
     edit_by_uid_inner(db, &cal_href, uid, new_summary, due)
 }
@@ -2032,7 +2115,7 @@ fn delete_by_uid(db: &mut Connection, uid: &str) -> anyhow::Result<String> {
         anyhow::bail!("uid cannot be empty");
     }
 
-    let cal_href = active_list_href(db)?;
+    let cal_href = collection_for_uid(db, uid)?;
 
     delete_by_uid_inner(db, &cal_href, uid)
 }
@@ -2284,6 +2367,7 @@ fn save_config_inner(db: &mut Connection, payload: &str) -> anyhow::Result<()> {
         // hand-edited `[ui] color` would be silently reset on every save.
         ui: old.as_ref().map(|c| c.ui.clone()).unwrap_or_default(),
         view: old.as_ref().map(|c| c.view.clone()).unwrap_or_default(),
+        lists: old.as_ref().map(|c| c.lists.clone()).unwrap_or_default(),
         caldav: config::CaldavConfig {
             provider,
             base_url,
@@ -2401,7 +2485,20 @@ fn create(db: &mut Connection, payload: &str) -> anyhow::Result<String> {
     let due = due_owned.trim();
     let due_opt = if due.is_empty() { None } else { Some(due) };
 
-    let cal_href = active_list_href(db)?;
+    // The view is merged, so it no longer names a single list to create into:
+    // the destination is its own setting.
+    db::ensure_local_list(db)?;
+    let cfg = config::load()?;
+    let mut cal_href = config::default_target(&cfg);
+    if !db::is_local_list(&cal_href) && !db::calendar_exists(db, &cal_href)? {
+        // The configured target has gone -- discovery dropped it, or the
+        // account changed. Fall back rather than fail, and say so loudly enough
+        // that tasks don't quietly pile up on-device.
+        eprintln!(
+            "retaskable: create target {cal_href} is unavailable; falling back to the local list"
+        );
+        cal_href = config::LOCAL_LIST_ID.to_string();
+    }
 
     let uid = Uuid::new_v4().to_string();
     if db::is_local_list(&cal_href) {
@@ -2603,7 +2700,10 @@ async fn resolve_first_conflict_inner(
         .context("parsing cached iCalendar (local intent)")?;
     let local_completed = matches!(local.status, nextcloud::TaskStatus::Completed);
 
-    let task_url = queue::build_task_url(calendar_url, &cached.href)?;
+    // The conflict belongs to the op, so its collection comes from the op
+    // too -- not from whichever list happens to be selected.
+    let collection = queue::resolve_collection_url(&op.target_calendar_href, calendar_url)?;
+    let task_url = queue::build_task_url(&collection, &cached.href)?;
     let server = nextcloud::get_task(client, &task_url, auth).await?;
 
     let server_view = match server {
@@ -2746,7 +2846,10 @@ async fn apply_keep_mine_inner(
         ));
     };
 
-    let task_url = queue::build_task_url(calendar_url, &cached.href)?;
+    // The conflict belongs to the op, so its collection comes from the op
+    // too -- not from whichever list happens to be selected.
+    let collection = queue::resolve_collection_url(&op.target_calendar_href, calendar_url)?;
+    let task_url = queue::build_task_url(&collection, &cached.href)?;
     let fresh = nextcloud::get_task(client, &task_url, auth).await?;
     let Some((fresh_etag, _fresh_ical)) = fresh else {
         return Ok(format!(
@@ -2846,7 +2949,10 @@ async fn apply_take_theirs_inner(
         ));
     };
 
-    let task_url = queue::build_task_url(calendar_url, &cached.href)?;
+    // The conflict belongs to the op, so its collection comes from the op
+    // too -- not from whichever list happens to be selected.
+    let collection = queue::resolve_collection_url(&op.target_calendar_href, calendar_url)?;
+    let task_url = queue::build_task_url(&collection, &cached.href)?;
     let fresh = nextcloud::get_task(client, &task_url, auth).await?;
 
     let tx = db.unchecked_transaction()?;

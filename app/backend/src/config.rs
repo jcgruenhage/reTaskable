@@ -17,6 +17,9 @@ pub struct Config {
     pub active_list: Option<String>,
     #[serde(default)]
     pub ui: UiConfig,
+    /// Which collection new tasks are created in.
+    #[serde(default)]
+    pub lists: ListsConfig,
     /// Persisted list filters. The list is narrowed by these, not by which
     /// collection is selected, so a filter survives a restart.
     #[serde(default)]
@@ -31,10 +34,23 @@ impl Default for Config {
         Self {
             active_list: Some(LOCAL_LIST_ID.to_string()),
             ui: UiConfig::default(),
+            lists: ListsConfig::default(),
             view: ViewConfig::default(),
             caldav: CaldavConfig::default(),
         }
     }
+}
+
+/// Collection selection.
+///
+/// Deliberately separate from [`ViewConfig`]: which list new tasks go into is
+/// not the same question as which lists are on screen. They used to be the same
+/// setting only because exactly one list was ever visible.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ListsConfig {
+    /// Collection new tasks are created in. May be [`LOCAL_LIST_ID`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_target: Option<String>,
 }
 
 /// Filters applied to the task list, persisted so a narrowed list survives a
@@ -60,6 +76,9 @@ pub struct ViewConfig {
     /// Matched against each tag's key, so it is the broader of the two.
     #[serde(default)]
     pub tag_keys: Vec<String>,
+    /// Collection hrefs to show. Empty means every collection.
+    #[serde(default)]
+    pub collections: Vec<String>,
 }
 
 impl ViewConfig {
@@ -72,6 +91,7 @@ impl ViewConfig {
             || !self.due_on.is_empty()
             || !self.tags.is_empty()
             || !self.tag_keys.is_empty()
+            || !self.collections.is_empty()
     }
 }
 
@@ -198,6 +218,23 @@ pub fn active_list(cfg: &Config) -> Option<&str> {
         .or(cfg.caldav.calendar_href.as_deref())
 }
 
+/// The collection new tasks are created in.
+///
+/// Falls back through the pre-merge single-selection field and finally to the
+/// on-device list, which always exists and never needs an account -- so a
+/// create can never fail for want of a destination.
+pub fn default_target(cfg: &Config) -> String {
+    if let Some(target) = cfg.lists.default_target.as_deref() {
+        if !target.is_empty() {
+            return target.to_string();
+        }
+    }
+    match active_list(cfg) {
+        Some(active) if !active.is_empty() => active.to_string(),
+        _ => LOCAL_LIST_ID.to_string(),
+    }
+}
+
 pub fn has_remote(cfg: &Config) -> bool {
     !cfg.caldav.base_url.trim().is_empty()
         && !cfg.caldav.username.trim().is_empty()
@@ -265,6 +302,44 @@ mod tests {
             toml::from_str(&std::fs::read_to_string(&path).unwrap()).expect("parse");
         assert!(parsed.caldav.calendar.is_none());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn default_target_falls_back_rather_than_failing() {
+        // Nothing configured at all: the on-device list always exists, so a
+        // create can never be left without a destination.
+        assert_eq!(default_target(&Config::default()), LOCAL_LIST_ID);
+
+        // A pre-merge config has no [lists] table; the list it had selected
+        // stays the destination, so an upgrade doesn't silently relocate tasks.
+        let legacy: Config = toml::from_str(
+            r#"active_list = "https://nc.test/tasks/work/"
+
+[caldav]
+base_url = "https://nc.test"
+username = "u"
+app_password = "p"
+calendar_href = "https://nc.test/tasks/work/"
+"#,
+        )
+        .unwrap();
+        assert_eq!(default_target(&legacy), "https://nc.test/tasks/work/");
+
+        // An explicit target wins over the legacy selection.
+        let explicit: Config = toml::from_str(
+            r#"active_list = "https://nc.test/tasks/work/"
+
+[lists]
+default_target = "local://default"
+
+[caldav]
+base_url = "https://nc.test"
+username = "u"
+app_password = "p"
+"#,
+        )
+        .unwrap();
+        assert_eq!(default_target(&explicit), LOCAL_LIST_ID);
     }
 
     #[test]

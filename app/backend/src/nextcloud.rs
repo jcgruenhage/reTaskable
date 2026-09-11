@@ -1505,6 +1505,7 @@ pub fn format_tasks_json(
     last_synced: Option<&str>,
     conflicts: i64,
     view: &crate::config::ViewConfig,
+    collections: &HashMap<String, crate::db::TaskList>,
 ) -> String {
     let mut sorted: Vec<&Task> = tasks.iter().collect();
     sorted.sort_by_key(|t| {
@@ -1531,6 +1532,13 @@ pub fn format_tasks_json(
                 // CATEGORIES verbatim, in document order. The UI shows the whole
                 // tag and colours it by its key, so no splitting happens here.
                 "tags": t.categories,
+                // Which list this row came from. Meaningful only now that more
+                // than one can be on screen at a time.
+                "collection": collections.get(&t.uid).map(|c| serde_json::json!({
+                    "id": c.id,
+                    "name": c.display_name,
+                    "kind": c.kind,
+                })),
                 "mark": mark,
                 "source": sources.get(&t.uid).cloned().unwrap_or_default(),
                 // M15 machine anchor for jump-back: doc UUID + page key ("idx:N").
@@ -1555,6 +1563,7 @@ pub fn format_tasks_json(
             "due_on": view.due_on,
             "tags": view.tags,
             "tag_keys": view.tag_keys,
+            "collections": view.collections,
             "filtered": view.is_filtered(),
         },
     })
@@ -2321,6 +2330,7 @@ mod tests {
             None,
             0,
             &Default::default(),
+            &HashMap::new(),
         );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["last_synced"], serde_json::Value::Null);
@@ -2356,6 +2366,7 @@ mod tests {
             Some("Last synced 5 minutes ago."),
             0,
             &Default::default(),
+            &HashMap::new(),
         );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["last_synced"], "Last synced 5 minutes ago.");
@@ -2386,6 +2397,7 @@ mod tests {
             None,
             3,
             &Default::default(),
+            &HashMap::new(),
         );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["tasks"][0]["mark"], "!");
@@ -2410,6 +2422,7 @@ mod tests {
             None,
             0,
             &Default::default(),
+            &HashMap::new(),
         );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         let arr = v["tasks"].as_array().unwrap();

@@ -70,6 +70,12 @@ pub fn tag_matches(task_tags: &[String], wanted: &[String], wanted_keys: &[Strin
         .any(|key| wanted_keys.iter().any(|w| w == key))
 }
 
+/// Whether a collection passes the active collection filter. Empty means every
+/// collection, so a fresh config shows the merged list in full.
+pub fn collection_matches(collection: &str, wanted: &[String]) -> bool {
+    wanted.is_empty() || wanted.iter().any(|w| w == collection)
+}
+
 /// Apply the persisted view to a task list.
 ///
 /// `include_completed` widens rather than narrows, which is why it is not part
@@ -230,6 +236,22 @@ mod tests {
         view.tags.clear();
         view.tag_keys = vec!["area".to_string()];
         assert!(view.is_filtered());
+    }
+
+    #[test]
+    fn an_empty_collection_filter_shows_every_collection() {
+        assert!(collection_matches("local://default", &[]));
+        assert!(collection_matches("https://s.test/work/", &[]));
+        let only_work = vec!["https://s.test/work/".to_string()];
+        assert!(collection_matches("https://s.test/work/", &only_work));
+        assert!(!collection_matches("local://default", &only_work));
+        // Several selected collections are a union, so both stay visible.
+        let both = vec![
+            "https://s.test/work/".to_string(),
+            "local://default".to_string(),
+        ];
+        assert!(collection_matches("https://s.test/work/", &both));
+        assert!(collection_matches("local://default", &both));
     }
 
     #[test]

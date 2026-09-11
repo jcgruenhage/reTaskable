@@ -28,6 +28,11 @@ Rectangle {
     property string viewDueOn: ""
     property var viewTags: []
     property var viewTagKeys: []
+    property var viewCollections: []
+    // Where new tasks go. Independent of what the list shows, so it is carried
+    // separately rather than derived from the filter.
+    property string createTargetId: "local://default"
+    property string createTargetName: "On This reMarkable"
     property bool viewFiltered: false
 
     // M14 UX: number of conflict-resolvable errored ops, from the MSG 104
@@ -50,11 +55,14 @@ Rectangle {
     property string detailDueOriginal: ""
     property string detailSource: ""
     property string detailMark: ""
+    property string detailCollectionId: ""
+    property string detailCollectionName: ""
     // M15 jump-back: the source note's machine anchor for the open task.
     property string detailDoc: ""
     property string detailPage: ""
 
     // M11: settings screen state.
+    property bool targetPickerOpen: false
     property bool settingsOpen: false
     property bool settingsHasPassword: false
     property bool settingsPasswordVisible: false
@@ -132,7 +140,15 @@ Rectangle {
                 return
             }
             if (type === 105 || type === 108 || type === 119 || type === 120) {
-                statusText.text = contents
+                // A create targets the destination, not the view, so the new
+                // task can land outside the active filter and look like it was
+                // never created. Say so rather than letting it read as a bug.
+                if (type === 108 && root.viewFiltered) {
+                    statusText.text = contents + " — in " + root.createTargetName
+                        + ", which the current filter may hide."
+                } else {
+                    statusText.text = contents
+                }
                 root.refreshList()
                 return
             }
@@ -204,7 +220,26 @@ Rectangle {
     }
 
     function clearFilters() {
-        root.setView({ due: "", due_on: "", tags: [], tag_keys: [] })
+        root.setView({ due: "", due_on: "", tags: [], tag_keys: [], collections: [] })
+    }
+
+    // Chips toggle: tapping a selected collection deselects it, and deselecting
+    // the last one returns to the full merged list.
+    function toggleCollection(id) {
+        var next = []
+        var found = false
+        for (var i = 0; i < root.viewCollections.length; i++) {
+            if (root.viewCollections[i] === id) { found = true; continue }
+            next.push(root.viewCollections[i])
+        }
+        if (!found) next.push(id)
+        root.setView({ collections: next })
+    }
+
+    function setCreateTarget(id) {
+        root.targetPickerOpen = false
+        endpoint.sendMessage(27, id)
+        root.refreshSources()
     }
 
     // Tapping a tag pill narrows to that exact tag -- the same "this value"
@@ -218,11 +253,21 @@ Rectangle {
     // header indicator. Empty when nothing is.
     function filterLabel() {
         var parts = []
+        for (var c = 0; c < root.viewCollections.length; c++) {
+            parts.push(root.collectionName(root.viewCollections[c]))
+        }
         for (var i = 0; i < root.viewTags.length; i++) parts.push(root.viewTags[i])
         for (var j = 0; j < root.viewTagKeys.length; j++) parts.push(root.viewTagKeys[j] + ":*")
         var dueLabel = root.dueFilterLabel()
         if (dueLabel.length > 0) parts.push(dueLabel)
         return parts.join(" + ")
+    }
+
+    function collectionName(id) {
+        for (var i = 0; i < sourcesModel.count; i++) {
+            if (sourcesModel.get(i).source_id === id) return sourcesModel.get(i).display_name
+        }
+        return id
     }
 
     function dueFilterLabel() {
@@ -249,6 +294,7 @@ Rectangle {
         sourcesModel.clear()
         root.activeListId = data.active ? data.active : "local://default"
         root.displayColor = data.color === true
+        root.createTargetId = data.default_target ? data.default_target : "local://default"
         root.remoteDestinationId = ""
         var sources = data.sources || []
         for (var i = 0; i < sources.length; i++) {
@@ -259,6 +305,9 @@ Rectangle {
             })
             if (sources[i].id === root.activeListId) {
                 root.activeListName = sources[i].display_name
+            }
+            if (sources[i].id === root.createTargetId) {
+                root.createTargetName = sources[i].display_name
             }
             if (sources[i].kind === "caldav" && root.remoteDestinationId.length === 0) {
                 root.remoteDestinationId = sources[i].id
@@ -506,6 +555,8 @@ Rectangle {
                 // an array of plain strings doesn't survive that, so the tags
                 // travel as JSON and the delegate parses them back.
                 tagsJson: JSON.stringify(t.tags ? t.tags : []),
+                collectionId: t.collection ? t.collection.id : "",
+                collectionName: t.collection ? t.collection.name : "",
                 // Expansion lives in the model, not the delegate: ListView
                 // recycles delegates, so a flag held there would jump to
                 // whichever row scrolled into that slot. Rebuilding the model
@@ -526,6 +577,7 @@ Rectangle {
         root.viewDueOn = view.due_on ? view.due_on : ""
         root.viewTags = view.tags ? view.tags : []
         root.viewTagKeys = view.tag_keys ? view.tag_keys : []
+        root.viewCollections = view.collections ? view.collections : []
         root.viewFiltered = view.filtered === true
         taskList.contentY = 0
         var synced = data.last_synced ? data.last_synced : "Not yet synced — tap Sync."
@@ -563,6 +615,8 @@ Rectangle {
         root.detailDue = t.due ? t.due : ""
         root.detailSource = t.source ? t.source : ""
         root.detailMark = t.mark ? t.mark : ""
+        root.detailCollectionId = t.collectionId ? t.collectionId : ""
+        root.detailCollectionName = t.collectionName ? t.collectionName : ""
         root.detailDoc = t.doc ? t.doc : ""
         root.detailPage = t.page ? t.page : ""
         root.detailDeleteArmed = false
@@ -593,8 +647,11 @@ Rectangle {
     }
 
     // Human-readable pending-sync state from the row's mark.
+    // Keyed off the task's own collection, not a globally selected list: in a
+    // merged view a local and a synced task sit side by side, and one label
+    // cannot be right for both.
     function markLabel(m) {
-        if (root.activeListId === "local://default") return "Stored on this reMarkable"
+        if (root.detailCollectionId === "local://default") return "Stored on this reMarkable"
         if (m === "!") return "Sync error — will retry"
         if (m === "*") return "Queued — not yet synced"
         return "Synced"
@@ -729,24 +786,33 @@ Rectangle {
                 Repeater {
                     model: sourcesModel
 
+                    // The strip no longer selects which single list is shown --
+                    // every list is shown at once now. Each chip is a collection
+                    // filter instead: same position, same tap, narrower meaning.
+                    // With none selected the merged list is shown in full.
                     delegate: Rectangle {
+                        id: sourceChip
+                        required property string source_id
+                        required property string display_name
+                        readonly property bool selected:
+                            root.viewCollections.indexOf(source_id) !== -1
                         width: Math.max(210, sourceLabel.implicitWidth + 30)
                         height: 56
-                        color: model.source_id === root.activeListId ? "black" : "white"
+                        color: selected ? "black" : "white"
                         border.color: "black"
                         border.width: 2
 
                         Text {
                             id: sourceLabel
                             anchors.centerIn: parent
-                            text: model.display_name
+                            text: sourceChip.display_name
                             font.pixelSize: 21
-                            color: model.source_id === root.activeListId ? "white" : "black"
+                            color: sourceChip.selected ? "white" : "black"
                         }
 
                         MouseArea {
                             anchors.fill: parent
-                            onClicked: endpoint.sendMessage(23, model.source_id)
+                            onClicked: root.toggleCollection(sourceChip.source_id)
                         }
                     }
                 }
@@ -866,7 +932,44 @@ Rectangle {
                 }
             }
 
-            DueField { id: createDue; width: parent.width }
+            // Second line of the create row is "properties of the task you are
+            // about to make": when it is due, and which list it lands in.
+            Row {
+                width: parent.width
+                spacing: 16
+
+                DueField {
+                    id: createDue
+                    width: parent.width - targetBtn.width - 16
+                }
+
+                Rectangle {
+                    id: targetBtn
+                    // With only the on-device list available there is nothing to
+                    // choose between, so the control stays out of the way.
+                    visible: sourcesModel.count > 1
+                    width: 300
+                    height: 72
+                    color: "white"
+                    border.color: "black"
+                    border.width: 3
+
+                    Text {
+                        anchors.centerIn: parent
+                        width: parent.width - 24
+                        horizontalAlignment: Text.AlignHCenter
+                        elide: Text.ElideRight
+                        text: "→ " + root.createTargetName
+                        font.pixelSize: 21
+                        color: "black"
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: root.targetPickerOpen = true
+                    }
+                }
+            }
         }
 
         // Action controls — all on one line: Sync, Settings, Show/Hide
@@ -1155,6 +1258,8 @@ Rectangle {
             readonly property var rowTags: JSON.parse(model.tagsJson)
             readonly property bool rowCompleted: model.completed === true
             readonly property bool expandedRow: model.expanded === true
+            readonly property string rowCollectionName: model.collectionName
+            readonly property string rowCollectionId: model.collectionId
             readonly property int hiddenTagCount: taskRow.expandedRow
                 ? 0
                 : Math.max(0, taskRow.rowTags.length - taskRow.maxCollapsedTags)
@@ -1263,6 +1368,23 @@ Rectangle {
                                         anchors.fill: parent
                                         onClicked: root.filterByTag(collapsedTag.modelData)
                                     }
+                                }
+                            }
+
+                            // Which list this row came from. Only meaningful
+                            // now that several are on screen at once, so it is
+                            // hidden while the view is already narrowed to one.
+                            Pill {
+                                id: collectionPill
+                                visible: taskRow.rowCollectionName.length > 0
+                                         && root.viewCollections.length !== 1
+                                text: taskRow.rowCollectionName
+                                colored: false
+                                muted: taskRow.rowCompleted
+
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: root.toggleCollection(taskRow.rowCollectionId)
                                 }
                             }
 
@@ -1390,6 +1512,78 @@ Rectangle {
                   : (root.showCompleted ? "No tasks." : "No open tasks. Tap Show Completed to review done items.")
             font.pixelSize: 28
             color: "#303030"
+        }
+    }
+
+    // ---- Destination picker (which list new tasks are created in) ----
+    Rectangle {
+        id: targetPickerOverlay
+        anchors.fill: parent
+        color: "white"
+        visible: root.targetPickerOpen
+        z: 160
+
+        Column {
+            anchors.fill: parent
+            anchors.margins: 40
+            spacing: 20
+
+            Text {
+                text: "Create new tasks in"
+                font.pixelSize: 30
+                font.bold: true
+                color: "black"
+            }
+
+            Repeater {
+                model: sourcesModel
+
+                delegate: Rectangle {
+                    id: targetOption
+                    required property string source_id
+                    required property string display_name
+                    readonly property bool chosen: source_id === root.createTargetId
+                    width: targetPickerOverlay.width - 80
+                    height: 80
+                    color: chosen ? "black" : "white"
+                    border.color: "black"
+                    border.width: 3
+
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.left: parent.left
+                        anchors.leftMargin: 24
+                        text: targetOption.display_name
+                        font.pixelSize: 26
+                        color: targetOption.chosen ? "white" : "black"
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: root.setCreateTarget(targetOption.source_id)
+                    }
+                }
+            }
+
+            Rectangle {
+                width: 240
+                height: 72
+                color: "white"
+                border.color: "black"
+                border.width: 3
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "Cancel"
+                    font.pixelSize: 24
+                    color: "black"
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: root.targetPickerOpen = false
+                }
+            }
         }
     }
 

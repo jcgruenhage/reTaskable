@@ -1079,6 +1079,28 @@ pub fn list_tasks(conn: &Connection, calendar_href: &str) -> Result<Vec<Task>> {
 /// M9b deliberately scopes to toggle + edit; delete/create double-412s
 /// remain only recoverable via Clear Errored. M10 will replace the
 /// string match with a typed `error_kind` column.
+/// The collection a cached task lives in, located by UID alone.
+///
+/// Per-task operations have to target the task's own collection rather than
+/// whatever list the UI currently shows -- once more than one collection is
+/// visible at a time, those are no longer the same thing. A UID is unique
+/// within a collection but nothing guarantees it across them, so a UID found in
+/// several is reported as ambiguous rather than silently resolved to one.
+pub fn find_collection_for_uid(conn: &Connection, uid: &str) -> Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT calendar_href FROM task \
+          WHERE uid = ?1 AND pending_delete = 0",
+    )?;
+    let hrefs: Vec<String> = stmt
+        .query_map(params![uid], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    match hrefs.len() {
+        0 => Ok(None),
+        1 => Ok(hrefs.into_iter().next()),
+        n => anyhow::bail!("uid {uid} is cached in {n} collections; refusing to guess"),
+    }
+}
+
 pub fn first_resolvable_conflict(conn: &Connection) -> Result<Option<PendingOp>> {
     let row = conn
         .query_row(
@@ -2909,7 +2931,37 @@ mod tests {
     }
 
     #[test]
-        fn count_resolvable_conflicts_matches_first_resolvable_predicate() {
+    fn find_collection_for_uid_locates_the_tasks_own_list() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, uid)
+             VALUES ('https://s.test/work/', '/work/a.ics', 'e', 'i', 'A', 'needs-action', 'uid-a'),
+                    ('https://s.test/home/', '/home/b.ics', 'e', 'i', 'B', 'needs-action', 'uid-b')",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(
+            find_collection_for_uid(&conn, "uid-b").unwrap().as_deref(),
+            Some("https://s.test/home/"),
+            "the second collection must be found without any list being selected"
+        );
+        assert_eq!(find_collection_for_uid(&conn, "nope").unwrap(), None);
+
+        // The same UID in two collections is ambiguous. Guessing would send the
+        // op to an arbitrary one of them, so this is an error, not a coin flip.
+        conn.execute(
+            "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, uid)
+             VALUES ('https://s.test/third/', '/third/a.ics', 'e', 'i', 'A', 'needs-action', 'uid-a')",
+            [],
+        )
+        .unwrap();
+        assert!(find_collection_for_uid(&conn, "uid-a").is_err());
+    }
+
+    #[test]
+    fn count_resolvable_conflicts_matches_first_resolvable_predicate() {
         let conn = fresh();
         ensure_schema_v2(&conn).expect("migrate");
         assert_eq!(count_resolvable_conflicts(&conn).unwrap(), 0);
