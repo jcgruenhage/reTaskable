@@ -366,6 +366,11 @@ async fn dispatch_edit(
         .as_ref()
         .and_then(|v| v.get("due"))
         .map(|d| d.as_str().unwrap_or("").to_string());
+    // Same contract as `due`: present means set or clear, absent means leave.
+    let description: Option<String> = payload
+        .as_ref()
+        .and_then(|v| v.get("description"))
+        .map(|d| d.as_str().unwrap_or("").to_string());
 
     let cached = match fetch_cached_for_dispatch(conn, &op.target_calendar_href, &op.target_uid) {
         Ok(opt) => opt,
@@ -382,6 +387,7 @@ async fn dispatch_edit(
 
     let new_summary_for_closure = new_summary.clone();
     let due_for_closure = due.clone();
+    let description_for_closure = description.clone();
     match crate::nextcloud::put_task_with_retry(
         http,
         &task_url,
@@ -391,8 +397,14 @@ async fn dispatch_edit(
         move |ical| {
             let s = crate::nextcloud::replace_summary(ical, &new_summary_for_closure);
             // Re-apply DUE on a 412 re-derive so a conflict can't drop the date.
-            Ok(match &due_for_closure {
+            let s = match &due_for_closure {
                 Some(token) => crate::nextcloud::set_due(&s, token),
+                None => s,
+            };
+            // Likewise the description: a re-derive against the server's newer
+            // body must not silently discard the edit being flushed.
+            Ok(match &description_for_closure {
+                Some(text) => crate::nextcloud::set_description(&s, text),
                 None => s,
             })
         },

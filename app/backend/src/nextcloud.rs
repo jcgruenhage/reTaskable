@@ -1038,11 +1038,13 @@ fn apply_vtodo_mutations(ical: &str, mutations: &[(&str, Option<String>)]) -> St
     let mut out = String::new();
     let mut in_vtodo = false;
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut skipping_folded = false;
 
     for line in ical.split_inclusive('\n') {
         let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
 
         if in_vtodo && trimmed == "END:VTODO" {
+            skipping_folded = false;
             // Append any mutations we never matched on (new properties to add).
             for (key, value) in mutations.iter() {
                 if !seen.contains(key) {
@@ -1064,8 +1066,20 @@ fn apply_vtodo_mutations(ical: &str, mutations: &[(&str, Option<String>)]) -> St
         }
 
         if in_vtodo {
+            // RFC 5545 3.1 folding: a line beginning with a space or tab
+            // continues the one above it. When that property was just replaced
+            // or dropped, its continuations have to go with it -- otherwise the
+            // tail of the *old* value folds onto the new one and silently
+            // corrupts it.
+            if skipping_folded {
+                if line.starts_with(' ') || line.starts_with('\t') {
+                    continue;
+                }
+                skipping_folded = false;
+            }
             if let Some((key, value)) = matching_mutation(trimmed, mutations) {
                 seen.insert(key);
+                skipping_folded = true;
                 match value {
                     Some(v) => {
                         // Replace the existing line with the new value, preserving CRLF style.
@@ -1253,6 +1267,66 @@ pub fn extract_source_label(ical_text: &str) -> Option<String> {
 /// UUID (`X-RETASKABLE-SOURCE-DOC`) and page key (`X-RETASKABLE-SOURCE-PAGE`, e.g.
 /// `idx:0`). Unlike the LABEL these are not RFC 5545 text-escaped (a UUID / `idx:N`
 /// has no specials), so no unescape — just unfold + prefix-strip + trim.
+/// Read the VTODO `DESCRIPTION`, unfolded and unescaped.
+///
+/// Returns `None` when absent or empty, so callers can treat "no notes" and "an
+/// empty notes field" identically -- the detail view has no use for the
+/// distinction, and round-tripping it would only produce empty properties.
+pub fn extract_description(ical_text: &str) -> Option<String> {
+    let unfolded = unfold_ical(ical_text);
+    for line in unfolded.lines() {
+        let Some(rest) = line.strip_prefix("DESCRIPTION") else {
+            continue;
+        };
+        // Parameters may sit between the name and the value's colon, and a
+        // quoted parameter value may contain one, so track quoting rather than
+        // taking the first colon in the line.
+        let mut in_quotes = false;
+        for (idx, ch) in rest.char_indices() {
+            match ch {
+                '"' => in_quotes = !in_quotes,
+                ':' if !in_quotes => {
+                    let value = unescape_ical_text(&rest[idx + 1..]);
+                    let trimmed = value.trim();
+                    return if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    };
+                }
+                ';' => {}
+                // Anything else in first position means a different property
+                // that merely starts with the same letters.
+                _ if idx == 0 => break,
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Set or clear the VTODO `DESCRIPTION`.
+///
+/// An empty or whitespace-only value drops the property rather than writing an
+/// empty one, which is what other CalDAV clients show for "no notes".
+pub fn set_description(ical_text: &str, description: &str) -> String {
+    let ical_text = ensure_crlf(ical_text);
+    let now = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let value = if description.trim().is_empty() {
+        None
+    } else {
+        Some(escape_ical_text(description.trim()))
+    };
+    apply_vtodo_mutations(
+        &ical_text,
+        &[
+            ("DESCRIPTION", value),
+            ("DTSTAMP", Some(now.clone())),
+            ("LAST-MODIFIED", Some(now)),
+        ],
+    )
+}
+
 pub fn extract_source_doc(ical_text: &str) -> Option<String> {
     extract_xprop(ical_text, "X-RETASKABLE-SOURCE-DOC:")
 }
@@ -1570,6 +1644,7 @@ pub fn format_tasks_json(
             "tags": view.tags,
             "tag_keys": view.tag_keys,
             "collections": view.collections,
+            "query": view.query,
             "filtered": view.is_filtered(),
         },
     })
@@ -1700,8 +1775,9 @@ fn propstat_is_ok(propstat: &roxmltree::Node) -> bool {
 mod tests {
     use super::{
         discover_calendars, due_property_line, ensure_crlf, escape_ical_text, extract_source_doc,
-        extract_categories, extract_source_label, extract_source_page, filter_for_display,
-        format_tasks_json, get_task, parse_vtodos_first, tag_key,
+        extract_categories, extract_description, extract_source_label, extract_source_page,
+        filter_for_display, format_tasks_json, get_task, parse_vtodos_first, set_description,
+        tag_key,
         is_icloud_caldav_host, parse_sync_response, redirect_allowed, replace_summary, set_due,
         sync_collection_unsupported, unescape_ical_text,
     };
@@ -2338,7 +2414,121 @@ mod tests {
     }
 
     #[test]
-        fn format_tasks_json_empty_renders_empty_envelope() {
+    fn description_roundtrips_through_folding_and_escaping() {
+        let ical = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:u1\r\nSUMMARY:Tiles\r\n\
+                    DESCRIPTION:Ask about grout\\, then measure\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        assert_eq!(
+            extract_description(ical).as_deref(),
+            Some("Ask about grout, then measure"),
+            "an escaped comma is part of the text, not a separator"
+        );
+
+        // A server-folded value has to be read whole.
+        let folded = "BEGIN:VTODO\r\nDESCRIPTION:the first part \r\n and the second\r\nEND:VTODO\r\n";
+        assert_eq!(
+            extract_description(folded).as_deref(),
+            Some("the first part and the second")
+        );
+
+        // Absent and empty both read as "no notes".
+        assert_eq!(extract_description("BEGIN:VTODO\r\nEND:VTODO\r\n"), None);
+        assert_eq!(
+            extract_description("BEGIN:VTODO\r\nDESCRIPTION:\r\nEND:VTODO\r\n"),
+            None
+        );
+        // A property that merely starts with the same letters is not it.
+        assert_eq!(
+            extract_description("BEGIN:VTODO\r\nDESCRIPTION-X:nope\r\nEND:VTODO\r\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn setting_a_description_replaces_the_whole_folded_value() {
+        // The regression this guards: replacing a folded property used to leave
+        // its continuation lines behind, so the tail of the *old* value folded
+        // onto the new one and silently corrupted it.
+        let ical = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:u1\r\nSUMMARY:Tiles\r\n\
+                    DESCRIPTION:old text that was \r\n folded across lines\r\n\
+                    STATUS:NEEDS-ACTION\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let out = set_description(ical, "brand new notes");
+        assert_eq!(extract_description(&out).as_deref(), Some("brand new notes"));
+        assert!(
+            !out.contains("folded across lines"),
+            "no orphaned continuation lines may survive:\n{out}"
+        );
+        // Untouched properties stay put.
+        assert!(out.contains("SUMMARY:Tiles"));
+        assert!(out.contains("STATUS:NEEDS-ACTION"));
+    }
+
+    #[test]
+    fn an_empty_description_drops_the_property_entirely() {
+        let ical = "BEGIN:VTODO\r\nUID:u1\r\nDESCRIPTION:something\r\nEND:VTODO\r\n";
+        let cleared = set_description(ical, "   ");
+        assert_eq!(extract_description(&cleared), None);
+        assert!(
+            !cleared.contains("DESCRIPTION"),
+            "an empty property is worse than none:\n{cleared}"
+        );
+    }
+
+    #[test]
+    fn a_description_is_added_when_the_task_had_none() {
+        let ical = "BEGIN:VTODO\r\nUID:u1\r\nSUMMARY:Tiles\r\nEND:VTODO\r\n";
+        let out = set_description(ical, "new notes");
+        assert_eq!(extract_description(&out).as_deref(), Some("new notes"));
+    }
+
+    #[test]
+    fn multi_line_descriptions_survive_the_round_trip() {
+        let ical = "BEGIN:VTODO\r\nUID:u1\r\nEND:VTODO\r\n";
+        let out = set_description(ical, "first line\nsecond line");
+        // Newlines are escaped on the wire, per RFC 5545.
+        assert!(out.contains("\\n"), "newline must be escaped:\n{out}");
+        assert_eq!(
+            extract_description(&out).as_deref(),
+            Some("first line\nsecond line")
+        );
+    }
+
+    #[test]
+    fn replacing_a_folded_property_discards_its_continuation_lines() {
+        // A server is free to fold any long value across lines. Replacing only
+        // the first line left the remainder behind, and because a continuation
+        // folds onto whatever precedes it, the tail of the *old* summary became
+        // part of the new one.
+        let ical = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:u1\r\n\
+                    SUMMARY:a summary long enough that the server \r\n split it across lines\r\n\
+                    STATUS:NEEDS-ACTION\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let out = replace_summary(ical, "short summary");
+
+        assert!(out.contains("SUMMARY:short summary"));
+        assert!(
+            !out.contains("split it across lines"),
+            "the old value's continuation must not survive:\n{out}"
+        );
+        // Properties either side of the replaced one are untouched.
+        assert!(out.contains("UID:u1"));
+        assert!(out.contains("STATUS:NEEDS-ACTION"));
+        assert!(out.contains("END:VTODO"));
+    }
+
+    #[test]
+    fn folding_of_other_properties_is_left_alone() {
+        // Only the replaced property's continuations are dropped; an unrelated
+        // folded value has to survive intact.
+        let ical = "BEGIN:VTODO\r\nUID:u1\r\nSUMMARY:old\r\n\
+                    DESCRIPTION:notes that are \r\n folded across lines\r\nEND:VTODO\r\n";
+        let out = replace_summary(ical, "new");
+        assert!(out.contains("SUMMARY:new"));
+        assert!(
+            out.contains(" folded across lines"),
+            "an unrelated folded value must be preserved:\n{out}"
+        );
+    }
+    #[test]
+    fn format_tasks_json_empty_renders_empty_envelope() {
         let out = format_tasks_json(
             &[],
             &HashMap::new(),

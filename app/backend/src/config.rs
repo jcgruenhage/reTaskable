@@ -84,6 +84,10 @@ pub struct ViewConfig {
     /// Collection hrefs to show. Empty means every collection.
     #[serde(default)]
     pub collections: Vec<String>,
+    /// Free-text search. Matched against the text the list actually shows, so a
+    /// task never matches on something the user cannot see.
+    #[serde(default)]
+    pub query: String,
 }
 
 impl ViewConfig {
@@ -97,6 +101,7 @@ impl ViewConfig {
             || !self.tags.is_empty()
             || !self.tag_keys.is_empty()
             || !self.collections.is_empty()
+            || !self.query.trim().is_empty()
     }
 }
 

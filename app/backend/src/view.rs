@@ -6,6 +6,8 @@
 //! concept -- a task due today should not read as overdue because the machine
 //! is a few hours ahead in UTC.
 
+use std::collections::HashMap;
+
 use crate::config::ViewConfig;
 use crate::nextcloud::{Task, TaskStatus};
 
@@ -76,12 +78,36 @@ pub fn collection_matches(collection: &str, wanted: &[String]) -> bool {
     wanted.is_empty() || wanted.iter().any(|w| w == collection)
 }
 
+/// Whether a task satisfies the active free-text query.
+///
+/// Deliberately limited to text the list renders -- the summary and, when the
+/// task was captured from a notebook, its source label. The cached iCal would
+/// be free to search, but matching on a DESCRIPTION that reTaskable never shows
+/// produces a result the user cannot explain, which reads as a bug.
+///
+/// Matching is a case-insensitive substring test: at a few hundred cached rows
+/// that is far below anything worth indexing for.
+pub fn matches_query(summary: &str, source_label: Option<&str>, query: &str) -> bool {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+    if summary.to_lowercase().contains(&needle) {
+        return true;
+    }
+    source_label.is_some_and(|label| label.to_lowercase().contains(&needle))
+}
 /// Apply the persisted view to a task list.
 ///
 /// `include_completed` widens rather than narrows, which is why it is not part
 /// of [`ViewConfig::is_filtered`]: showing finished tasks is not a state anyone
 /// needs warning about.
-pub fn apply(tasks: Vec<Task>, view: &ViewConfig, today: &str) -> Vec<Task> {
+pub fn apply(
+    tasks: Vec<Task>,
+    view: &ViewConfig,
+    today: &str,
+    source_labels: &HashMap<String, String>,
+) -> Vec<Task> {
     tasks
         .into_iter()
         .filter(|task| {
@@ -90,6 +116,13 @@ pub fn apply(tasks: Vec<Task>, view: &ViewConfig, today: &str) -> Vec<Task> {
         })
         .filter(|task| due_matches(task.due.as_deref(), &view.due, &view.due_on, today))
         .filter(|task| tag_matches(&task.categories, &view.tags, &view.tag_keys))
+        .filter(|task| {
+            matches_query(
+                &task.summary,
+                source_labels.get(&task.uid).map(String::as_str),
+                &view.query,
+            )
+        })
         .collect()
 }
 
@@ -166,9 +199,9 @@ mod tests {
             task("cancelled", Some("20260910"), TaskStatus::Cancelled),
         ];
         let mut view = ViewConfig::default();
-        assert_eq!(apply(tasks.clone(), &view, TODAY).len(), 1);
+        assert_eq!(apply(tasks.clone(), &view, TODAY, &HashMap::new()).len(), 1);
         view.include_completed = true;
-        assert_eq!(apply(tasks, &view, TODAY).len(), 3);
+        assert_eq!(apply(tasks, &view, TODAY, &HashMap::new()).len(), 3);
     }
 
     #[test]
@@ -184,7 +217,7 @@ mod tests {
             due: "overdue".to_string(),
             ..Default::default()
         };
-        let kept = apply(tasks, &view, TODAY);
+        let kept = apply(tasks, &view, TODAY, &HashMap::new());
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].uid, "overdue-open");
     }
@@ -252,6 +285,54 @@ mod tests {
         ];
         assert!(collection_matches("https://s.test/work/", &both));
         assert!(collection_matches("local://default", &both));
+    }
+
+    #[test]
+    fn query_matches_only_text_the_row_shows() {
+        assert!(matches_query("Buy cabinet handles", None, "cabinet"));
+        // Case-insensitive in both directions.
+        assert!(matches_query("Buy Cabinet Handles", None, "CABINET"));
+        assert!(!matches_query("Buy cabinet handles", None, "sink"));
+        // The note-source label is on screen, so it is searchable too.
+        assert!(matches_query("Tiles", Some("Kitchen notes p3"), "kitchen"));
+        assert!(!matches_query("Tiles", None, "kitchen"));
+        // An empty or whitespace-only query is no filter at all.
+        assert!(matches_query("anything", None, ""));
+        assert!(matches_query("anything", None, "   "));
+    }
+
+    #[test]
+    fn query_composes_with_the_other_filters() {
+        let tasks = vec![
+            task("a", Some("20260910"), TaskStatus::NeedsAction),
+            task("b", Some("20261001"), TaskStatus::NeedsAction),
+        ];
+        // `task()` uses the uid as the summary, so "a" matches only the first.
+        let view = ViewConfig {
+            due: "overdue".to_string(),
+            query: "a".to_string(),
+            ..Default::default()
+        };
+        let kept = apply(tasks.clone(), &view, TODAY, &HashMap::new());
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].uid, "a");
+
+        // Same query, a due filter the match cannot satisfy: nothing survives.
+        let view = ViewConfig {
+            due: "today".to_string(),
+            query: "a".to_string(),
+            ..Default::default()
+        };
+        assert!(apply(tasks, &view, TODAY, &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn a_query_counts_as_filtered() {
+        let mut view = ViewConfig::default();
+        view.query = "  ".to_string();
+        assert!(!view.is_filtered(), "whitespace is not a search");
+        view.query = "cabinet".to_string();
+        assert!(view.is_filtered());
     }
 
     #[test]

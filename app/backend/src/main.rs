@@ -43,6 +43,7 @@ const MSG_TRANSFER_TASK: u32 = 24;
 const MSG_GET_DIAGNOSTICS: u32 = 25;
 const MSG_SET_VIEW: u32 = 26;
 const MSG_SET_TARGET: u32 = 27;
+const MSG_GET_DESCRIPTION: u32 = 28;
 const MSG_PONG: u32 = 101;
 const MSG_NEXTCLOUD_RESPONSE: u32 = 102;
 const MSG_CALENDARS_RESPONSE: u32 = 103;
@@ -70,6 +71,7 @@ const MSG_TRANSFER_TASK_RESPONSE: u32 = 124;
 const MSG_GET_DIAGNOSTICS_RESPONSE: u32 = 125;
 const MSG_SET_VIEW_RESPONSE: u32 = 126;
 const MSG_SET_TARGET_RESPONSE: u32 = 127;
+const MSG_GET_DESCRIPTION_RESPONSE: u32 = 128;
 
 #[tokio::main]
 async fn main() {
@@ -417,6 +419,14 @@ impl AppLoadBackend for Backend {
                 };
                 send(replier, MSG_SET_TARGET_RESPONSE, &response);
             }
+
+            MSG_GET_DESCRIPTION => {
+                let response = match get_description(&self.db, &msg.contents) {
+                    Ok(s) => s,
+                    Err(e) => format!("error: {e:#}"),
+                };
+                send(replier, MSG_GET_DESCRIPTION_RESPONSE, &response);
+            }
             MSG_GET_DIAGNOSTICS => {
                 send(
                     replier,
@@ -566,13 +576,21 @@ fn show_tasks(db: &mut Connection) -> anyhow::Result<String> {
         if !view::collection_matches(&list.id, &view.collections) {
             continue;
         }
-        let listed = view::apply(db::list_tasks(db, &list.id)?, &view, &today);
+        // Source labels are loaded before filtering, because the free-text
+        // query matches against them too -- they are text the row displays.
+        let list_sources = db::source_labels(db, &list.id)?;
+        let listed = view::apply(
+            db::list_tasks(db, &list.id)?,
+            &view,
+            &today,
+            &list_sources,
+        );
         for task in &listed {
             collections.insert(task.uid.clone(), list.clone());
         }
         tasks.extend(listed);
         marks.extend(db::pending_marks(db, &list.id)?);
-        sources.extend(db::source_labels(db, &list.id)?);
+        sources.extend(list_sources);
         anchors.extend(db::source_anchors(db, &list.id)?);
 
         if db::is_local_list(&list.id) {
@@ -659,6 +677,10 @@ fn set_view(payload: &str) -> anyhow::Result<String> {
             .map(str::to_string)
             .collect();
     }
+
+    if let Some(query) = v.get("query").and_then(|x| x.as_str()) {
+        cfg.view.query = query.trim().to_string();
+    }
     let due = v.get("due").and_then(|x| x.as_str()).map(str::trim);
     let due_on = v.get("due_on").and_then(|x| x.as_str()).map(str::trim);
     match (due, due_on) {
@@ -679,6 +701,22 @@ fn set_view(payload: &str) -> anyhow::Result<String> {
     Ok(serde_json::json!({ "ok": true }).to_string())
 }
 
+/// MSG_GET_DESCRIPTION handler.
+///
+/// Fetched on demand rather than carried in the task envelope: a description is
+/// only ever shown on the detail page, and descriptions can be long. Putting
+/// one on every row would re-serialise all of them on every list refresh, which
+/// on e-ink is the redraw path that has to stay cheap.
+fn get_description(db: &Connection, uid: &str) -> anyhow::Result<String> {
+    let uid = uid.trim();
+    if uid.is_empty() {
+        anyhow::bail!("uid cannot be empty");
+    }
+    let description = db::get_ical_by_uid(db, uid)?
+        .and_then(|ical| nextcloud::extract_description(&ical))
+        .unwrap_or_default();
+    Ok(serde_json::json!({ "uid": uid, "description": description }).to_string())
+}
 fn show_pending(db: &mut Connection) -> anyhow::Result<String> {
     let ops = db::list_pending_ops(db)?;
     let mut errors = Vec::new();
@@ -864,7 +902,8 @@ mod tests {
         db::enqueue_create(&mut conn, "/cal/", "uid-1", "Buy milk").unwrap();
 
         let out =
-            edit_by_uid_inner(&mut conn, "/cal/", "uid-1", "Buy oat milk", None).expect("edit");
+            edit_by_uid_inner(&mut conn, "/cal/", "uid-1", "Buy oat milk", None, None)
+                .expect("edit");
         assert!(out.contains("Buy milk"), "old summary in status: {out}");
         assert!(out.contains("Buy oat milk"), "new summary in status: {out}");
 
@@ -883,7 +922,7 @@ mod tests {
         use rusqlite::Connection;
         let mut conn = Connection::open_in_memory().unwrap();
         db::ensure_schema_v2(&conn).unwrap();
-        assert!(edit_by_uid_inner(&mut conn, "/cal/", "nope", "x", None).is_err());
+        assert!(edit_by_uid_inner(&mut conn, "/cal/", "nope", "x", None, None).is_err());
     }
 
     #[test]
@@ -2136,6 +2175,10 @@ fn edit_by_uid(db: &mut Connection, payload: &str) -> anyhow::Result<String> {
     // The detail dialog always sends `due` (the prefilled-or-edited token), so a
     // present key drives set/clear; an absent key means a summary-only edit.
     let due: Option<&str> = v.get("due").map(|x| x.as_str().unwrap_or("").trim());
+    // Same contract for the description: a present key sets or clears it, an
+    // absent key leaves whatever the body already has. The create row never
+    // sends one -- descriptions are a detail-view concern only.
+    let description: Option<&str> = v.get("description").map(|x| x.as_str().unwrap_or(""));
     let new_summary = v
         .get("summary")
         .and_then(|x| x.as_str())
@@ -2150,7 +2193,7 @@ fn edit_by_uid(db: &mut Connection, payload: &str) -> anyhow::Result<String> {
 
     let cal_href = collection_for_uid(db, uid)?;
 
-    edit_by_uid_inner(db, &cal_href, uid, new_summary, due)
+    edit_by_uid_inner(db, &cal_href, uid, new_summary, due, description)
 }
 
 /// Enqueue an edit for a specific UID and return a `Queued: ...` status string.
@@ -2164,18 +2207,19 @@ fn edit_by_uid_inner(
     uid: &str,
     new_summary: &str,
     due: Option<&str>,
+    description: Option<&str>,
 ) -> anyhow::Result<String> {
     let Some(task) = db::get_cached_task_by_uid(db, cal_href, uid)? else {
         anyhow::bail!("no task with uid {uid}");
     };
     let old_summary = task.summary.clone();
     if db::is_local_list(cal_href) {
-        db::edit_local(db, uid, new_summary, due)?;
+        db::edit_local(db, uid, new_summary, due, description)?;
         Ok(format!(
             "Updated local task \"{old_summary}\" -> \"{new_summary}\""
         ))
     } else {
-        let op_id = db::enqueue_edit(db, cal_href, uid, new_summary, due)?;
+        let op_id = db::enqueue_edit(db, cal_href, uid, new_summary, due, description)?;
         Ok(format!(
             "Queued: edit \"{old_summary}\" -> \"{new_summary}\" (#{op_id})"
         ))
@@ -2805,12 +2849,12 @@ fn edit_first(db: &mut Connection, summary: &str) -> anyhow::Result<String> {
 
     let old_summary = task.summary.clone();
     if db::is_local_list(&cal_href) {
-        db::edit_local(db, &task.uid, new_summary, None)?;
+        db::edit_local(db, &task.uid, new_summary, None, None)?;
         Ok(format!(
             "Updated local task \"{old_summary}\" -> \"{new_summary}\""
         ))
     } else {
-        let op_id = db::enqueue_edit(db, &cal_href, &task.uid, new_summary, None)?;
+        let op_id = db::enqueue_edit(db, &cal_href, &task.uid, new_summary, None, None)?;
         Ok(format!(
             "Queued: edit \"{old_summary}\" -> \"{new_summary}\" (#{op_id})"
         ))

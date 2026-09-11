@@ -29,6 +29,7 @@ Rectangle {
     property var viewTags: []
     property var viewTagKeys: []
     property var viewCollections: []
+    property string viewQuery: ""
     // Where new tasks go. Independent of what the list shows, so it is carried
     // separately rather than derived from the filter.
     property string createTargetId: "local://default"
@@ -57,6 +58,12 @@ Rectangle {
     property string detailMark: ""
     property string detailCollectionId: ""
     property string detailCollectionName: ""
+    // Descriptions are fetched per task rather than carried on every row: they
+    // are only ever shown here, and putting one on each row would re-serialise
+    // all of them on every list refresh.
+    property string detailDescription: ""
+    property string detailDescriptionOriginal: ""
+    property bool detailDescriptionLoading: false
     // M15 jump-back: the source note's machine anchor for the open task.
     property string detailDoc: ""
     property string detailPage: ""
@@ -148,6 +155,10 @@ Rectangle {
                 root.applyToggleResult(contents)
                 return
             }
+            if (type === 128) {
+                root.applyDescription(contents)
+                return
+            }
             if (type === 105 || type === 108 || type === 119 || type === 120) {
                 // A create targets the destination, not the view, so the new
                 // task can land outside the active filter and look like it was
@@ -229,7 +240,10 @@ Rectangle {
     }
 
     function clearFilters() {
-        root.setView({ due: "", due_on: "", tags: [], tag_keys: [], collections: [] })
+        searchInput.text = ""
+        root.setView({
+            due: "", due_on: "", tags: [], tag_keys: [], collections: [], query: ""
+        })
     }
 
     // Chips toggle: tapping a selected collection deselects it, and deselecting
@@ -262,6 +276,7 @@ Rectangle {
     // header indicator. Empty when nothing is.
     function filterLabel() {
         var parts = []
+        if (root.viewQuery.length > 0) parts.push("\"" + root.viewQuery + "\"")
         for (var c = 0; c < root.viewCollections.length; c++) {
             parts.push(root.collectionName(root.viewCollections[c]))
         }
@@ -650,7 +665,13 @@ Rectangle {
         root.viewTags = view.tags ? view.tags : []
         root.viewTagKeys = view.tag_keys ? view.tag_keys : []
         root.viewCollections = view.collections ? view.collections : []
+        root.viewQuery = view.query ? view.query : ""
         root.viewFiltered = view.filtered === true
+        // Only correct the field when it has genuinely drifted, so a refresh
+        // arriving mid-edit doesn't overwrite what is being typed.
+        if (searchInput.text !== root.viewQuery) {
+            searchInput.text = root.viewQuery
+        }
         taskList.contentY = 0
         var synced = data.last_synced ? data.last_synced : "Not yet synced — tap Sync."
         statusText.text = synced + "   (" + tasks.length + (root.showCompleted ? " shown, incl. completed)" : " open)")
@@ -692,6 +713,13 @@ Rectangle {
         root.detailDoc = t.doc ? t.doc : ""
         root.detailPage = t.page ? t.page : ""
         root.detailDeleteArmed = false
+        // Cleared first so the previous task's notes can't flash up under the
+        // new one while the reply is in flight.
+        root.detailDescription = ""
+        root.detailDescriptionOriginal = ""
+        detailDescriptionInput.text = ""
+        root.detailDescriptionLoading = true
+        endpoint.sendMessage(28, t.uid)
         detailSummaryInput.text = t.summary
         // M16: prefill the due editor from the row, and record the normalized
         // token so Save can detect a real due change.
@@ -703,6 +731,24 @@ Rectangle {
     // Close the detail dialog, releasing focus from the summary editor and
     // dismissing the virtual keyboard (the TextArea raised it on focus; nothing
     // else takes it down on the way back to the list).
+    // Reply to MSG 28. Ignored unless it is for the task still on screen: a
+    // slow reply for a dialog the user already closed must not overwrite what
+    // they are looking at now.
+    function applyDescription(jsonText) {
+        var d
+        try {
+            d = JSON.parse(jsonText)
+        } catch (e) {
+            root.detailDescriptionLoading = false
+            return
+        }
+        if (!d.uid || d.uid !== root.detailUid) return
+        root.detailDescription = d.description ? d.description : ""
+        root.detailDescriptionOriginal = root.detailDescription
+        detailDescriptionInput.text = root.detailDescription
+        root.detailDescriptionLoading = false
+    }
+
     function closeDetail() {
         detailSummaryInput.focus = false
         Qt.inputMethod.hide()
@@ -1219,6 +1265,50 @@ Rectangle {
                 MouseArea {
                     anchors.fill: parent
                     onClicked: root.clearFilters()
+                }
+            }
+        }
+
+        // Search is submit-based, never live. Filtering per keystroke would
+        // repaint the whole list on every character, and on e-ink that is the
+        // one thing the UI cannot afford -- the rest of this screen is built
+        // around making each redraw a deliberate, single event.
+        Row {
+            width: parent.width
+            spacing: 12
+
+            TextField {
+                id: searchInput
+                width: parent.width - searchBtn.width - 12
+                height: 60
+                font.pixelSize: 22
+                color: "black"
+                placeholderTextColor: "#505050"
+                placeholderText: "Search summaries and note sources"
+                onAccepted: root.setView({ query: searchInput.text })
+            }
+
+            Rectangle {
+                id: searchBtn
+                width: 160
+                height: 60
+                color: "white"
+                border.color: "black"
+                border.width: 3
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "Search"
+                    font.pixelSize: 22
+                    color: "black"
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        Qt.inputMethod.hide()
+                        root.setView({ query: searchInput.text })
+                    }
                 }
             }
         }
@@ -2294,6 +2384,35 @@ Rectangle {
 
             DueField { id: detailDueField; width: parent.width }
 
+            Text {
+                text: root.detailDescriptionLoading ? "Notes (loading…)" : "Notes"
+                font.pixelSize: 22
+                color: "#303030"
+            }
+
+            // Multi-line, because a description routinely is. No live binding
+            // back to the model: it is saved explicitly with the rest of the
+            // dialog, like the summary and the due date.
+            Rectangle {
+                width: parent.width
+                height: 240
+                color: "white"
+                border.color: "black"
+                border.width: 3
+
+                TextArea {
+                    id: detailDescriptionInput
+                    anchors.fill: parent
+                    anchors.margins: 8
+                    font.pixelSize: 22
+                    color: "black"
+                    wrapMode: TextArea.Wrap
+                    placeholderText: "Notes for this task"
+                    placeholderTextColor: "#606060"
+                    enabled: !root.detailDescriptionLoading
+                }
+            }
+
             Row {
                 spacing: 16
 
@@ -2303,7 +2422,8 @@ Rectangle {
                     // either the summary text or the due token (vs what we opened with).
                     property bool active: detailSummaryInput.text.trim().length > 0
                                           && (detailSummaryInput.text.trim() !== root.detailSummary
-                                              || detailDueField.token !== root.detailDueOriginal)
+                                              || detailDueField.token !== root.detailDueOriginal
+                                              || detailDescriptionInput.text !== root.detailDescriptionOriginal)
                     width: 240
                     height: 72
                     color: detailSaveBtn.active ? "white" : "#dddddd"
@@ -2325,7 +2445,8 @@ Rectangle {
                             endpoint.sendMessage(19, JSON.stringify({
                                 uid: root.detailUid,
                                 summary: detailSummaryInput.text.trim(),
-                                due: detailDueField.token
+                                due: detailDueField.token,
+                                description: detailDescriptionInput.text
                             }))
                             root.closeDetail()
                         }
