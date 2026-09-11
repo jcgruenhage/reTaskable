@@ -31,6 +31,11 @@ pub struct Task {
     pub summary: String,
     pub status: TaskStatus,
     pub due: Option<String>,
+    /// CATEGORIES entries, in document order. Read-only for now: reTaskable
+    /// renders and filters on them but never rewrites them, so a tag set stays
+    /// exactly as the user's other CalDAV client left it.
+    #[serde(default)]
+    pub categories: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -1264,6 +1269,96 @@ fn extract_xprop(ical_text: &str, prefix: &str) -> Option<String> {
     None
 }
 
+/// Tag namespace: everything before the first `:` in a tag, so `project:kitchen`
+/// and `project:garden` share the key `project`. A tag without a separator is its
+/// own key. The key is what the UI hashes into a pill color, which is the point —
+/// one color per namespace, not per individual tag.
+pub fn tag_key(tag: &str) -> &str {
+    match tag.find(TAG_SEPARATORS) {
+        // A leading separator leaves no namespace; treat the whole thing as the key.
+        Some(0) | None => tag,
+        Some(idx) => &tag[..idx],
+    }
+}
+
+/// The `key:value` separator inside a single CATEGORIES entry. Plain CalDAV
+/// clients see `project:kitchen` as an ordinary opaque tag, which is exactly the
+/// intended degradation — nothing else in the ecosystem needs to understand it.
+/// Both `:` and `/` are accepted: the first reads as key:value, the second is
+/// how Obsidian and most issue trackers nest tags, and neither needs escaping
+/// inside a CATEGORIES value. Accepting both means a tag written in either
+/// style by another client still keys correctly here.
+pub const TAG_SEPARATORS: &[char] = &[':', '/'];
+
+/// Extract every CATEGORIES entry from a VTODO body, in document order, with
+/// duplicates removed.
+///
+/// RFC 5545 allows the property to appear more than once *and* to carry a
+/// comma-separated list, so both are unioned here. Splitting honors escaping:
+/// `\,` is a literal comma inside one tag, not a separator.
+pub fn extract_categories(ical_text: &str) -> Vec<String> {
+    let unfolded = unfold_ical(ical_text);
+    let mut out: Vec<String> = Vec::new();
+    for line in unfolded.lines() {
+        let Some(raw_value) = categories_value(line) else {
+            continue;
+        };
+        for tag in split_unescaped_commas(raw_value) {
+            let tag = unescape_ical_text(&tag).trim().to_string();
+            if !tag.is_empty() && !out.contains(&tag) {
+                out.push(tag);
+            }
+        }
+    }
+    out
+}
+
+/// Return the value portion of a CATEGORIES line, or `None` for any other
+/// property. Parameters may appear between the name and the `:` that opens the
+/// value, and a quoted parameter value may itself contain a `:`, so the scan
+/// tracks quoting rather than taking the first colon.
+fn categories_value(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("CATEGORIES")?;
+    let mut in_quotes = false;
+    for (idx, ch) in rest.char_indices() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            ':' if !in_quotes => return Some(&rest[idx + 1..]),
+            // Anything other than a parameter list means this was a different
+            // property that merely starts with the same letters.
+            ';' => {}
+            _ if idx == 0 => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Split on commas that are not escaped as `\,`.
+fn split_unescaped_commas(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            current.push('\\');
+            current.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == ',' {
+            out.push(std::mem::take(&mut current));
+        } else {
+            current.push(ch);
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    out.push(current);
+    out
+}
+
 fn matching_mutation<'a>(
     line: &str,
     mutations: &'a [(&'a str, Option<String>)],
@@ -1308,11 +1403,17 @@ fn parse_vtodos(ical_text: &str) -> Result<Vec<Task>> {
             .map(parse_status)
             .unwrap_or(TaskStatus::Unknown);
         let due = todo.property_value("DUE").map(|s| s.to_string());
+        // The icalendar crate collapses repeated properties into a single map
+        // entry, so CATEGORIES is read from the raw text instead: RFC 5545 lets
+        // the property appear more than once and both occurrences are the
+        // user's tags.
+        let categories = extract_categories(ical_text);
         out.push(Task {
             uid,
             summary,
             status,
             due,
+            categories,
         });
     }
     Ok(out)
@@ -1426,6 +1527,9 @@ pub fn format_tasks_json(
                 "summary": t.summary,
                 "completed": matches!(t.status, TaskStatus::Completed),
                 "due": t.due,
+                // CATEGORIES verbatim, in document order. The UI shows the whole
+                // tag and colours it by its key, so no splitting happens here.
+                "tags": t.categories,
                 "mark": mark,
                 "source": sources.get(&t.uid).cloned().unwrap_or_default(),
                 // M15 machine anchor for jump-back: doc UUID + page key ("idx:N").
@@ -1559,7 +1663,8 @@ fn propstat_is_ok(propstat: &roxmltree::Node) -> bool {
 mod tests {
     use super::{
         discover_calendars, due_property_line, ensure_crlf, escape_ical_text, extract_source_doc,
-        extract_source_label, extract_source_page, filter_for_display, format_tasks_json, get_task,
+        extract_categories, extract_source_label, extract_source_page, filter_for_display,
+        format_tasks_json, get_task, parse_vtodos_first, tag_key,
         is_icloud_caldav_host, parse_sync_response, redirect_allowed, replace_summary, set_due,
         sync_collection_unsupported, unescape_ical_text,
     };
@@ -2079,6 +2184,7 @@ mod tests {
             summary: summary.to_string(),
             status: TaskStatus::NeedsAction,
             due: None,
+            categories: Vec::new(),
         }
     }
 
@@ -2118,7 +2224,84 @@ mod tests {
     }
 
     #[test]
-    fn format_tasks_json_empty_renders_empty_envelope() {
+    fn tag_key_splits_on_either_convention() {
+        assert_eq!(tag_key("project:kitchen"), "project");
+        assert_eq!(tag_key("project/kitchen"), "project");
+        // Deeper paths still key on the outermost namespace, so every
+        // project:* shares one colour however nested it gets.
+        assert_eq!(tag_key("project:house:kitchen"), "project");
+        // No separator: the tag is its own key.
+        assert_eq!(tag_key("someday"), "someday");
+        // A leading separator leaves no namespace to speak of.
+        assert_eq!(tag_key(":orphan"), ":orphan");
+        assert_eq!(tag_key(""), "");
+    }
+
+    #[test]
+    fn extract_categories_unions_repeated_properties_and_lists() {
+        let ical = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\n\
+                    CATEGORIES:project:kitchen,area/home\r\n\
+                    CATEGORIES:goal:declutter\r\n\
+                    END:VTODO\r\nEND:VCALENDAR\r\n";
+        assert_eq!(
+            extract_categories(ical),
+            vec![
+                "project:kitchen".to_string(),
+                "area/home".to_string(),
+                "goal:declutter".to_string(),
+            ],
+            "RFC 5545 allows the property more than once; both are the user's"
+        );
+    }
+
+    #[test]
+    fn extract_categories_respects_escaping_and_parameters() {
+        // An escaped comma is part of one tag, not a separator -- splitting it
+        // would invent a tag nobody wrote.
+        let escaped = "BEGIN:VTODO\r\nCATEGORIES:shopping\\, urgent,home\r\nEND:VTODO\r\n";
+        assert_eq!(
+            extract_categories(escaped),
+            vec!["shopping, urgent".to_string(), "home".to_string()]
+        );
+
+        // Parameters sit between the name and the value's colon.
+        let parameterised = "BEGIN:VTODO\r\nCATEGORIES;LANGUAGE=en:work\r\nEND:VTODO\r\n";
+        assert_eq!(extract_categories(parameterised), vec!["work".to_string()]);
+
+        // A folded value is read whole.
+        let folded = "BEGIN:VTODO\r\nCATEGORIES:project:very-long-\r\n name,other\r\nEND:VTODO\r\n";
+        assert_eq!(
+            extract_categories(folded),
+            vec!["project:very-long-name".to_string(), "other".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_categories_ignores_other_properties_and_duplicates() {
+        let ical = "BEGIN:VTODO\r\n\
+                    CATEGORIES-X:not-ours\r\n\
+                    SUMMARY:CATEGORIES are not in here\r\n\
+                    CATEGORIES:a,a,b\r\n\
+                    END:VTODO\r\n";
+        assert_eq!(
+            extract_categories(ical),
+            vec!["a".to_string(), "b".to_string()],
+            "a property that merely starts with the same letters is not CATEGORIES"
+        );
+        assert!(extract_categories("BEGIN:VTODO\r\nEND:VTODO\r\n").is_empty());
+    }
+
+    #[test]
+    fn parsed_vtodo_carries_its_tags() {
+        let ical = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\n\
+                    UID:u1\r\nSUMMARY:Tiles\r\nSTATUS:NEEDS-ACTION\r\n\
+                    CATEGORIES:project:kitchen\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let task = parse_vtodos_first(ical).expect("parse");
+        assert_eq!(task.categories, vec!["project:kitchen".to_string()]);
+    }
+
+    #[test]
+        fn format_tasks_json_empty_renders_empty_envelope() {
         let out = format_tasks_json(
             &[],
             &HashMap::new(),
@@ -2141,12 +2324,14 @@ mod tests {
                 summary: "Buy milk".to_string(),
                 status: TaskStatus::NeedsAction,
                 due: None,
+                categories: Vec::new(),
             },
             Task {
                 uid: "uid-B".to_string(),
                 summary: "Pay rent".to_string(),
                 status: TaskStatus::Completed,
                 due: Some("2026-06-01".to_string()),
+                categories: Vec::new(),
             },
         ];
         let mut marks = HashMap::new();
@@ -2261,6 +2446,7 @@ mod tests {
             summary: uid.to_string(),
             status,
             due: None,
+            categories: Vec::new(),
         }
     }
 
