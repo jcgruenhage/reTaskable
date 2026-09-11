@@ -52,6 +52,14 @@ pub struct ViewConfig {
     /// Mutually exclusive with `due`; the setter clears whichever is not chosen.
     #[serde(default)]
     pub due_on: String,
+    /// Exact tags to narrow by, e.g. `project:kitchen`. A task matches if it
+    /// carries any of them.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Tag namespaces to narrow by, e.g. `project` selects every `project:*`.
+    /// Matched against each tag's key, so it is the broader of the two.
+    #[serde(default)]
+    pub tag_keys: Vec<String>,
 }
 
 impl ViewConfig {
@@ -60,7 +68,10 @@ impl ViewConfig {
     /// `include_completed` is excluded on purpose: it only ever makes the list
     /// longer, and warning someone that they can see more would be noise.
     pub fn is_filtered(&self) -> bool {
-        !self.due.is_empty() || !self.due_on.is_empty()
+        !self.due.is_empty()
+            || !self.due_on.is_empty()
+            || !self.tags.is_empty()
+            || !self.tag_keys.is_empty()
     }
 }
 

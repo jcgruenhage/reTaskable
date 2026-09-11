@@ -49,6 +49,27 @@ pub fn due_matches(due: Option<&str>, rule: &str, on: &str, today: &str) -> bool
     }
 }
 
+/// Whether a task's tags satisfy the active tag filter.
+///
+/// The two lists are a union, not an intersection: `tags` names exact tags and
+/// `tag_keys` names whole namespaces, and a task matching either is kept. That
+/// makes "narrow to project:kitchen" and "narrow to everything under project"
+/// composable rather than mutually exclusive.
+///
+/// Empty on both counts means no tag narrowing at all.
+pub fn tag_matches(task_tags: &[String], wanted: &[String], wanted_keys: &[String]) -> bool {
+    if wanted.is_empty() && wanted_keys.is_empty() {
+        return true;
+    }
+    if task_tags.iter().any(|tag| wanted.iter().any(|w| w == tag)) {
+        return true;
+    }
+    task_tags
+        .iter()
+        .map(|tag| crate::nextcloud::tag_key(tag))
+        .any(|key| wanted_keys.iter().any(|w| w == key))
+}
+
 /// Apply the persisted view to a task list.
 ///
 /// `include_completed` widens rather than narrows, which is why it is not part
@@ -62,6 +83,7 @@ pub fn apply(tasks: Vec<Task>, view: &ViewConfig, today: &str) -> Vec<Task> {
                 || !matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled)
         })
         .filter(|task| due_matches(task.due.as_deref(), &view.due, &view.due_on, today))
+        .filter(|task| tag_matches(&task.categories, &view.tags, &view.tag_keys))
         .collect()
 }
 
@@ -75,6 +97,7 @@ mod tests {
             summary: uid.to_string(),
             status,
             due: due.map(str::to_string),
+            categories: Vec::new(),
         }
     }
 
@@ -153,11 +176,60 @@ mod tests {
         let view = ViewConfig {
             include_completed: false,
             due: "overdue".to_string(),
-            due_on: String::new(),
+            ..Default::default()
         };
         let kept = apply(tasks, &view, TODAY);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].uid, "overdue-open");
+    }
+
+    #[test]
+    fn tag_filters_match_exact_tags_and_whole_namespaces() {
+        let tags = vec!["project:kitchen".to_string(), "area/home".to_string()];
+
+        // No filter at all.
+        assert!(tag_matches(&tags, &[], &[]));
+        // Exact tag.
+        assert!(tag_matches(&tags, &["project:kitchen".to_string()], &[]));
+        assert!(!tag_matches(&tags, &["project:garden".to_string()], &[]));
+        // Whole namespace, in either separator style.
+        assert!(tag_matches(&tags, &[], &["project".to_string()]));
+        assert!(tag_matches(&tags, &[], &["area".to_string()]));
+        assert!(!tag_matches(&tags, &[], &["goal".to_string()]));
+        // Union, not intersection: matching either list is enough.
+        assert!(tag_matches(
+            &tags,
+            &["project:kitchen".to_string()],
+            &["goal".to_string()]
+        ));
+        // A task with no tags cannot satisfy a tag filter.
+        assert!(!tag_matches(&[], &["project:kitchen".to_string()], &[]));
+        assert!(tag_matches(&[], &[], &[]));
+    }
+
+    #[test]
+    fn a_namespace_filter_is_broader_than_an_exact_one() {
+        let kitchen = vec!["project:kitchen".to_string()];
+        let garden = vec!["project:garden".to_string()];
+        let keys = vec!["project".to_string()];
+        // Both are under `project`, so the namespace keeps both...
+        assert!(tag_matches(&kitchen, &[], &keys));
+        assert!(tag_matches(&garden, &[], &keys));
+        // ... while the exact tag keeps only its own.
+        let exact = vec!["project:kitchen".to_string()];
+        assert!(tag_matches(&kitchen, &exact, &[]));
+        assert!(!tag_matches(&garden, &exact, &[]));
+    }
+
+    #[test]
+    fn tag_filters_count_as_filtered() {
+        let mut view = ViewConfig::default();
+        assert!(!view.is_filtered());
+        view.tags = vec!["project:kitchen".to_string()];
+        assert!(view.is_filtered());
+        view.tags.clear();
+        view.tag_keys = vec!["area".to_string()];
+        assert!(view.is_filtered());
     }
 
     #[test]

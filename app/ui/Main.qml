@@ -26,6 +26,8 @@ Rectangle {
     property bool showCompleted: false
     property string viewDue: ""
     property string viewDueOn: ""
+    property var viewTags: []
+    property var viewTagKeys: []
     property bool viewFiltered: false
 
     // M14 UX: number of conflict-resolvable errored ops, from the MSG 104
@@ -202,12 +204,28 @@ Rectangle {
     }
 
     function clearFilters() {
-        root.setView({ due: "", due_on: "" })
+        root.setView({ due: "", due_on: "", tags: [], tag_keys: [] })
+    }
+
+    // Tapping a tag pill narrows to that exact tag -- the same "this value"
+    // gesture a due pill uses. Widening to the whole namespace stays an
+    // explicit choice in the filter bar rather than an overloaded tap.
+    function filterByTag(tag) {
+        root.setView({ tags: [tag], tag_keys: [] })
     }
 
     // Human-readable description of what is currently hiding tasks, for the
     // header indicator. Empty when nothing is.
     function filterLabel() {
+        var parts = []
+        for (var i = 0; i < root.viewTags.length; i++) parts.push(root.viewTags[i])
+        for (var j = 0; j < root.viewTagKeys.length; j++) parts.push(root.viewTagKeys[j] + ":*")
+        var dueLabel = root.dueFilterLabel()
+        if (dueLabel.length > 0) parts.push(dueLabel)
+        return parts.join(" + ")
+    }
+
+    function dueFilterLabel() {
         if (root.viewDueOn.length > 0) return "due " + root.formatDue(root.viewDueOn)
         if (root.viewDue === "overdue") return "overdue"
         if (root.viewDue === "today") return "due today"
@@ -484,6 +502,16 @@ Rectangle {
                 summary: t.summary,
                 completed: t.completed === true,
                 due: t.due ? t.due : "",
+                // ListModel turns an array role into a nested ListModel, and
+                // an array of plain strings doesn't survive that, so the tags
+                // travel as JSON and the delegate parses them back.
+                tagsJson: JSON.stringify(t.tags ? t.tags : []),
+                // Expansion lives in the model, not the delegate: ListView
+                // recycles delegates, so a flag held there would jump to
+                // whichever row scrolled into that slot. Rebuilding the model
+                // on every refresh also collapses everything, so a sync never
+                // leaves rows randomly tall.
+                expanded: false,
                 mark: t.mark ? t.mark : "",
                 source: t.source ? t.source : "",
                 // M15 machine anchor for jump-back (empty when not note-captured).
@@ -496,6 +524,8 @@ Rectangle {
         root.showCompleted = view.include_completed === true
         root.viewDue = view.due ? view.due : ""
         root.viewDueOn = view.due_on ? view.due_on : ""
+        root.viewTags = view.tags ? view.tags : []
+        root.viewTagKeys = view.tag_keys ? view.tag_keys : []
         root.viewFiltered = view.filtered === true
         taskList.contentY = 0
         var synced = data.last_synced ? data.last_synced : "Not yet synced — tap Sync."
@@ -624,6 +654,37 @@ Rectangle {
             }
         }
         return "today"
+    }
+
+    // Everything before the first : or / is the tag's key. `project:kitchen` and
+    // `project/garden` therefore share the key `project`, and so share a colour;
+    // a tag with no separator is its own key.
+    function tagKey(tag) {
+        var cut = -1
+        for (var i = 0; i < tag.length; i++) {
+            var c = tag.charAt(i)
+            if (c === ":" || c === "/") { cut = i; break }
+        }
+        // A leading separator leaves no namespace -- key on the whole string.
+        return cut > 0 ? tag.substring(0, cut) : tag
+    }
+
+    // Deterministic key -> colour, so a namespace keeps the same colour across
+    // launches and devices without anything being stored. Hues are muted on
+    // purpose: e-ink colour saturation is low, and these have to stay legible
+    // as a pale fill behind dark text.
+    readonly property var tagPalette: [
+        "#2e6f9e", "#a3572a", "#4a7c3f", "#7a4a8c",
+        "#b03a48", "#2f7d77", "#8a6d1f", "#5a5f8c"
+    ]
+
+    function tagAccent(tag) {
+        var key = root.tagKey(tag)
+        var hash = 5381
+        for (var i = 0; i < key.length; i++) {
+            hash = ((hash * 33) ^ key.charCodeAt(i)) >>> 0
+        }
+        return root.tagPalette[hash % root.tagPalette.length]
     }
 
     // Amber matches the queued-op marker already used in the row, so "needs
@@ -1084,8 +1145,21 @@ Rectangle {
         }
 
         delegate: Rectangle {
+            id: taskRow
+            // Collapsed rows keep the fixed rhythm; only an expanded one grows,
+            // so the list stays even until the user asks for more.
+            readonly property int maxCollapsedTags: 2
+            // Hoisted out of `model` here, in the delegate's own scope: inside a
+            // nested Repeater `model` means that Repeater's own model property,
+            // so reading model.tagsJson down there would be a self-reference.
+            readonly property var rowTags: JSON.parse(model.tagsJson)
+            readonly property bool rowCompleted: model.completed === true
+            readonly property bool expandedRow: model.expanded === true
+            readonly property int hiddenTagCount: taskRow.expandedRow
+                ? 0
+                : Math.max(0, taskRow.rowTags.length - taskRow.maxCollapsedTags)
             width: taskList.width
-            height: 84
+            height: Math.max(84, rowBody.implicitHeight + 20)
             color: "white"
 
             // Single-tap the row to open the detail dialog. Placed BELOW the Row
@@ -1153,6 +1227,7 @@ Rectangle {
                 }
 
                 Column {
+                    id: rowBody
                     anchors.verticalCenter: parent.verticalCenter
                     width: parent.width - 20 - rowCheck.width - 42
                     spacing: 2
@@ -1169,6 +1244,58 @@ Rectangle {
                             anchors.right: parent.right
                             anchors.verticalCenter: parent.verticalCenter
                             spacing: 8
+
+                            Repeater {
+                                model: taskRow.expandedRow
+                                       ? []
+                                       : taskRow.rowTags.slice(0, taskRow.maxCollapsedTags)
+                                delegate: Pill {
+                                    id: collapsedTag
+                                    required property string modelData
+                                    text: modelData
+                                    colored: root.displayColor
+                                    accent: root.tagAccent(modelData)
+                                    muted: taskRow.rowCompleted
+
+                                    // Accepts the tap so it doesn't fall through
+                                    // to the row's open-detail handler below.
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        onClicked: root.filterByTag(collapsedTag.modelData)
+                                    }
+                                }
+                            }
+
+                            // Overflow chip. Tapping it grows this row to show
+                            // every tag rather than sending you to the detail
+                            // view -- the tags are right here, they just didn't fit.
+                            Pill {
+                                visible: taskRow.hiddenTagCount > 0
+                                text: "+" + taskRow.hiddenTagCount
+                                colored: root.displayColor
+                                accent: "#505050"
+                                muted: taskRow.rowCompleted
+
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: taskModel.setProperty(index, "expanded", true)
+                                }
+                            }
+
+                            // Collapse control, present only while expanded, so
+                            // growing a row is always reversible without a refresh.
+                            Pill {
+                                visible: taskRow.expandedRow
+                                text: "−"
+                                colored: root.displayColor
+                                accent: "#505050"
+                                muted: taskRow.rowCompleted
+
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: taskModel.setProperty(index, "expanded", false)
+                                }
+                            }
 
                             Pill {
                                 id: duePill
@@ -1205,6 +1332,32 @@ Rectangle {
                             elide: Text.ElideRight
                             color: model.completed ? "#606060" : "black"
                             font.strikeout: model.completed
+                        }
+                    }
+
+                    // Expanded tags wrap under the summary instead of competing
+                    // with it for the row's width. Visible only after a
+                    // deliberate tap on the overflow chip.
+                    Flow {
+                        width: parent.width
+                        visible: taskRow.expandedRow
+                        spacing: 8
+
+                        Repeater {
+                            model: taskRow.expandedRow ? taskRow.rowTags : []
+                            delegate: Pill {
+                                id: expandedTag
+                                required property string modelData
+                                text: modelData
+                                colored: root.displayColor
+                                accent: root.tagAccent(modelData)
+                                muted: taskRow.rowCompleted
+
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: root.filterByTag(expandedTag.modelData)
+                                }
+                            }
                         }
                     }
 

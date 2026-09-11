@@ -44,7 +44,7 @@ pub struct PendingOpView {
 pub const LOCAL_LIST_ID: &str = "local://default";
 pub const LOCAL_LIST_NAME: &str = "On This reMarkable";
 
-const SCHEMA_V3: &str = "
+const SCHEMA_V4: &str = "
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -67,6 +67,10 @@ CREATE TABLE IF NOT EXISTS task (
     status TEXT,
     due TEXT,
     uid TEXT NOT NULL,
+    -- CATEGORIES as a JSON array of strings. JSON rather than a delimited
+    -- string because a tag may itself contain a comma once unescaped, and
+    -- silently splitting one in half would invent a tag the user never wrote.
+    categories TEXT NOT NULL DEFAULT '[]',
     pending_delete INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (calendar_href, href)
 );
@@ -89,7 +93,7 @@ CREATE TABLE IF NOT EXISTS pending_op (
 CREATE INDEX IF NOT EXISTS idx_pending_op_drain ON pending_op(errored, id);
 ";
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 pub fn path() -> Result<PathBuf> {
     let base = dirs::data_dir().context("could not resolve user data dir")?;
@@ -156,10 +160,13 @@ fn configure_connection(conn: &Connection) -> Result<()> {
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
     let current = read_schema_version(conn)?;
     if current <= 1 {
-        migrate_fresh_or_legacy_to_v3(conn)
+        migrate_fresh_or_legacy_to_v4(conn)
             .with_context(|| format!("migrating db from v{current} to v{SCHEMA_VERSION}"))?;
     } else if current == 2 {
         migrate_v2_to_v3(conn).context("migrating db from v2 to v3")?;
+        migrate_v3_to_v4(conn).context("migrating db from v3 to v4")?;
+    } else if current == 3 {
+        migrate_v3_to_v4(conn).context("migrating db from v3 to v4")?;
     } else if current != SCHEMA_VERSION {
         anyhow::bail!(
             "unsupported database schema v{current}; this build supports v{SCHEMA_VERSION}"
@@ -196,7 +203,7 @@ fn read_schema_version(conn: &Connection) -> Result<i64> {
     Ok(v.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0))
 }
 
-fn migrate_fresh_or_legacy_to_v3(conn: &Connection) -> Result<()> {
+fn migrate_fresh_or_legacy_to_v4(conn: &Connection) -> Result<()> {
     // v1 never contained a durable offline queue and was previously treated as
     // disposable cache. Preserve the historical behavior only for v0/v1;
     // v2 and later use non-destructive migrations below.
@@ -210,8 +217,8 @@ fn migrate_fresh_or_legacy_to_v3(conn: &Connection) -> Result<()> {
          DROP TABLE IF EXISTS meta;",
     )
     .context("dropping pre-v2 tables")?;
-    conn.execute_batch(SCHEMA_V3)
-        .context("applying v3 schema")?;
+    conn.execute_batch(SCHEMA_V4)
+        .context("applying v4 schema")?;
     conn.execute(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
         params![SCHEMA_VERSION.to_string()],
@@ -228,11 +235,62 @@ fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
     )
     .context("adding calendar.kind")?;
     tx.execute(
+        "UPDATE meta SET value = '3' WHERE key = 'schema_version'",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Add the cached tag column, backfilling it from iCal text already in the
+/// cache.
+///
+/// Backfilling matters: without it tags would stay invisible until the next
+/// full sync replaced every row, so an upgrade would look like the feature
+/// simply doesn't work.
+fn migrate_v3_to_v4(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "ALTER TABLE task ADD COLUMN categories TEXT NOT NULL DEFAULT '[]'",
+        [],
+    )
+    .context("adding task.categories")?;
+
+    let rows: Vec<(String, String, String)> = {
+        let mut stmt = tx.prepare("SELECT calendar_href, href, ical_text FROM task")?;
+        let mapped = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (calendar_href, href, ical_text) in rows {
+        let tags = crate::nextcloud::extract_categories(&ical_text);
+        if tags.is_empty() {
+            continue;
+        }
+        tx.execute(
+            "UPDATE task SET categories = ?1 WHERE calendar_href = ?2 AND href = ?3",
+            params![encode_categories(&tags), calendar_href, href],
+        )?;
+    }
+
+    tx.execute(
         "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
         params![SCHEMA_VERSION.to_string()],
     )?;
     tx.commit()?;
     Ok(())
+}
+
+/// Tags in, JSON array out. Kept beside the decoder so the two cannot drift.
+fn encode_categories(tags: &[String]) -> String {
+    serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// JSON array in, tags out. A malformed or legacy value decodes to no tags
+/// rather than failing the read: a bad cache row should cost its own tags, not
+/// the whole list.
+fn decode_categories(raw: Option<&str>) -> Vec<String> {
+    raw.and_then(|text| serde_json::from_str::<Vec<String>>(text).ok())
+        .unwrap_or_default()
 }
 
 pub fn ensure_local_list(conn: &Connection) -> Result<()> {
@@ -400,16 +458,27 @@ pub fn upsert_task(
 ) -> Result<()> {
     let status = status_to_str(parsed.status);
     conn.execute(
-        "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)
+        "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, categories, pending_delete)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)
          ON CONFLICT(calendar_href, href) DO UPDATE SET
             etag = excluded.etag,
             ical_text = excluded.ical_text,
             summary = excluded.summary,
             status = excluded.status,
             due = excluded.due,
-            uid = excluded.uid",
-        params![calendar_href, task_href, etag, ical_text, parsed.summary, status, parsed.due, uid],
+            uid = excluded.uid,
+            categories = excluded.categories",
+        params![
+            calendar_href,
+            task_href,
+            etag,
+            ical_text,
+            parsed.summary,
+            status,
+            parsed.due,
+            uid,
+            encode_categories(&parsed.categories)
+        ],
     )?;
     Ok(())
 }
@@ -972,7 +1041,7 @@ pub fn list_tasks(conn: &Connection, calendar_href: &str) -> Result<Vec<Task>> {
     // SQLite gives us here -- so Show Tasks's first row and get_first_task's
     // first row come from the same total ordering.
     let mut stmt = conn.prepare(
-        "SELECT uid, summary, status, due FROM task WHERE calendar_href = ?1 AND pending_delete = 0 \
+        "SELECT uid, summary, status, due, categories FROM task WHERE calendar_href = ?1 AND pending_delete = 0 \
          ORDER BY \
            CASE WHEN status = 'completed' THEN 1 ELSE 0 END, \
            CASE WHEN due IS NULL THEN 1 ELSE 0 END, \
@@ -984,16 +1053,18 @@ pub fn list_tasks(conn: &Connection, calendar_href: &str) -> Result<Vec<Task>> {
         let summary: String = row.get(1)?;
         let status_str: Option<String> = row.get(2)?;
         let due: Option<String> = row.get(3)?;
-        Ok((uid, summary, status_str, due))
+        let categories: Option<String> = row.get(4)?;
+        Ok((uid, summary, status_str, due, categories))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (uid, summary, status_str, due) = row?;
+        let (uid, summary, status_str, due, categories) = row?;
         out.push(Task {
             uid,
             summary,
             status: status_from_str(status_str.as_deref()),
             due,
+            categories: decode_categories(categories.as_deref()),
         });
     }
     Ok(out)
@@ -1403,7 +1474,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_from_empty_db_creates_v3_layout() {
+    fn migration_from_empty_db_creates_v4_layout() {
         let conn = fresh();
         ensure_schema_v2(&conn).expect("migrate");
         // meta table populated
@@ -1414,7 +1485,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, "3");
+        assert_eq!(version, "4");
         // new task columns exist
         let cols: Vec<String> = conn
             .prepare("PRAGMA table_info(task)")
@@ -1572,7 +1643,7 @@ mod tests {
                 |r| { r.get::<_, String>(0) }
             )
             .unwrap(),
-            "3"
+            "4"
         );
         assert_eq!(
             conn.query_row("SELECT kind FROM calendar WHERE href='/cal/'", [], |r| {
@@ -1636,6 +1707,7 @@ mod tests {
             summary: "hello".into(),
             status: TaskStatus::NeedsAction,
             due: None,
+            categories: Vec::new(),
         };
 
         upsert_task(
@@ -1666,6 +1738,7 @@ mod tests {
             summary: "hello again".into(),
             status: TaskStatus::Completed,
             due: None,
+            categories: Vec::new(),
         };
         upsert_task(
             &conn,
@@ -2771,7 +2844,72 @@ mod tests {
     }
 
     #[test]
-    fn count_resolvable_conflicts_matches_first_resolvable_predicate() {
+    fn migration_from_v3_backfills_tags_from_cached_ical() {
+        // Without the backfill, tags would stay invisible until a full resync
+        // replaced every cached row -- an upgrade would look like the feature
+        // simply doesn't work.
+        let conn = fresh();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE calendar (
+                href TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'caldav',
+                sync_token TEXT,
+                last_synced_at INTEGER
+             );
+             CREATE TABLE task (
+                calendar_href TEXT NOT NULL,
+                href TEXT NOT NULL,
+                etag TEXT NOT NULL,
+                ical_text TEXT NOT NULL,
+                summary TEXT,
+                status TEXT,
+                due TEXT,
+                uid TEXT NOT NULL,
+                pending_delete INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (calendar_href, href)
+             );
+             CREATE TABLE pending_op (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                op_type TEXT NOT NULL,
+                target_uid TEXT NOT NULL,
+                target_calendar_href TEXT NOT NULL,
+                payload TEXT,
+                enqueued_at INTEGER NOT NULL,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                errored INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO meta (key, value) VALUES ('schema_version', '3');",
+        )
+        .unwrap();
+        let tagged = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:u1\r\n\
+                      SUMMARY:Tiles\r\nCATEGORIES:project:kitchen,area/home\r\n\
+                      END:VTODO\r\nEND:VCALENDAR\r\n";
+        conn.execute(
+            "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, uid)
+             VALUES ('/cal/', '/cal/u1.ics', 'e', ?1, 'Tiles', 'needs-action', 'u1'),
+                    ('/cal/', '/cal/u2.ics', 'e', 'BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n', 'Bare', 'needs-action', 'u2')",
+            params![tagged],
+        )
+        .unwrap();
+
+        ensure_schema(&conn).expect("migrate v3 -> v4");
+
+        let tasks = list_tasks(&conn, "/cal/").unwrap();
+        let tiles = tasks.iter().find(|t| t.uid == "u1").expect("tagged task");
+        assert_eq!(
+            tiles.categories,
+            vec!["project:kitchen".to_string(), "area/home".to_string()],
+            "both separators should survive the backfill verbatim"
+        );
+        let bare = tasks.iter().find(|t| t.uid == "u2").expect("untagged task");
+        assert!(bare.categories.is_empty());
+    }
+
+    #[test]
+        fn count_resolvable_conflicts_matches_first_resolvable_predicate() {
         let conn = fresh();
         ensure_schema_v2(&conn).expect("migrate");
         assert_eq!(count_resolvable_conflicts(&conn).unwrap(), 0);

@@ -553,6 +553,26 @@ fn set_view(payload: &str) -> anyhow::Result<String> {
     if let Some(include) = v.get("include_completed").and_then(|x| x.as_bool()) {
         cfg.view.include_completed = include;
     }
+    // Absent means "leave alone"; present-but-empty means "clear". That
+    // distinction is what lets the UI set one axis without disturbing another.
+    if let Some(tags) = v.get("tags").and_then(|x| x.as_array()) {
+        cfg.view.tags = tags
+            .iter()
+            .filter_map(|t| t.as_str())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    if let Some(keys) = v.get("tag_keys").and_then(|x| x.as_array()) {
+        cfg.view.tag_keys = keys
+            .iter()
+            .filter_map(|t| t.as_str())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
     let due = v.get("due").and_then(|x| x.as_str()).map(str::trim);
     let due_on = v.get("due_on").and_then(|x| x.as_str()).map(str::trim);
     match (due, due_on) {
