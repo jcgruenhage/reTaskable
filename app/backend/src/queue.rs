@@ -2,7 +2,7 @@
 // This module orchestrates the offline queue drain: fetches pending ops from the DB,
 // dispatches each to the HTTP layer, and applies outcomes back to the DB.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use reqwest::Client;
 use rusqlite::{Connection, OptionalExtension};
 use std::error::Error;
@@ -144,6 +144,12 @@ fn has_status(msg: &str, code: u16) -> bool {
 /// failures (the errored op + cascade are recorded; other uid groups still
 /// flush). Each successful op's cache write + pending_op DELETE share a
 /// transaction (AC3.1 / AC5.1).
+/// Drain the outbox.
+///
+/// `fetch_next_drainable` returns ops across *all* collections, so the
+/// destination is resolved per op from its own `target_calendar_href` rather
+/// than from `calendar_url`. `calendar_url` remains only as the base a stored
+/// path-shaped href is resolved against -- it is never the destination itself.
 pub async fn flush_pending(
     conn: &mut Connection,
     http: &Client,
@@ -152,14 +158,49 @@ pub async fn flush_pending(
 ) -> Result<FlushSummary> {
     let mut summary = FlushSummary::default();
     while let Some(op) = db::fetch_next_drainable(conn)? {
+        // Local mutations are finalized at enqueue time and must never reach the
+        // network. A row here is debris from an interrupted local mutation in an
+        // older build; drop it, the same repair `ensure_local_list` performs.
+        if db::is_local_list(&op.target_calendar_href) {
+            db::delete_pending_op(conn, op.id)?;
+            continue;
+        }
         // Borrow conn immutably for dispatch_op, then re-borrow mutably for apply_outcome.
-        let outcome = dispatch_op(conn, http, auth, calendar_url, &op).await;
+        let outcome = match resolve_collection_url(&op.target_calendar_href, calendar_url) {
+            Ok(op_url) => dispatch_op(conn, http, auth, &op_url, &op).await,
+            // Unroutable is terminal, not transient: retrying cannot make a
+            // malformed href parse, and sending it to the configured collection
+            // instead is precisely the misdirection this function avoids.
+            Err(e) => ExecOutcome::Terminal(format!("unroutable collection: {e:#}")),
+        };
         let cont = apply_outcome(conn, &op, outcome, &mut summary)?;
         if !cont {
             break;
         }
     }
     Ok(summary)
+}
+
+/// Resolve the collection URL a queued op must be sent to.
+///
+/// `pending_op.target_calendar_href` records the op's own collection at enqueue
+/// time. Live rows hold an absolute URL; older rows hold a path, which is
+/// joined onto `base`. A path is joined rather than ignored on purpose --
+/// falling back to `base` wholesale would reintroduce the misdirection this
+/// exists to prevent.
+pub fn resolve_collection_url(op_href: &str, base: &Url) -> Result<Url> {
+    let href = op_href.trim();
+    if href.is_empty() {
+        anyhow::bail!("queued op records no target collection");
+    }
+    if let Ok(absolute) = Url::parse(href) {
+        if absolute.scheme() == "http" || absolute.scheme() == "https" {
+            return Ok(absolute);
+        }
+        anyhow::bail!("queued op targets non-HTTP collection {href}");
+    }
+    base.join(href)
+        .with_context(|| format!("resolving queued op collection {href}"))
 }
 
 async fn dispatch_op(
@@ -944,6 +985,112 @@ mod tests {
             })
             .unwrap();
         assert_eq!(etag, "etag-v2");
+    }
+
+    #[test]
+    fn resolve_collection_url_prefers_the_ops_own_href() {
+        let base: Url = "https://server.test/configured/".parse().unwrap();
+        // An absolute href is the destination outright -- the base is irrelevant.
+        assert_eq!(
+            resolve_collection_url("https://other.test/work/", &base)
+                .unwrap()
+                .as_str(),
+            "https://other.test/work/"
+        );
+        // A stored path is resolved against the base rather than discarded,
+        // which is what keeps legacy rows routable.
+        assert_eq!(
+            resolve_collection_url("/home/", &base).unwrap().as_str(),
+            "https://server.test/home/"
+        );
+        // A local list has no server side; routing one is a bug, not a fallback.
+        assert!(resolve_collection_url("local://default", &base).is_err());
+        assert!(resolve_collection_url("   ", &base).is_err());
+    }
+
+    #[tokio::test]
+    async fn flush_sends_each_op_to_its_own_collection() {
+        // The defect this guards: pending_op records target_calendar_href, and
+        // the drain used to ignore it -- every op went to the single
+        // calendar_url that sync() was configured with. With two collections
+        // queued at once that deletes from the wrong list.
+        use httpmock::prelude::*;
+        use rusqlite::params;
+
+        let server = MockServer::start_async().await;
+        let work = format!("{}/work/", server.base_url());
+        let home = format!("{}/home/", server.base_url());
+
+        let work_delete = server
+            .mock_async(|when, then| {
+                when.method(DELETE).path("/work/a.ics");
+                then.status(204);
+            })
+            .await;
+        let home_delete = server
+            .mock_async(|when, then| {
+                when.method(DELETE).path("/home/b.ics");
+                then.status(204);
+            })
+            .await;
+
+        let mut conn = fresh();
+        conn.execute(
+            "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, uid, pending_delete)
+             VALUES (?1, '/work/a.ics', 'e1', 'ical-a', 'A', 'needs-action', 'uid-a', 1),
+                    (?2, '/home/b.ics', 'e2', 'ical-b', 'B', 'needs-action', 'uid-b', 1)",
+            params![work, home],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at)
+             VALUES ('delete', 'uid-a', ?1, NULL, 0),
+                    ('delete', 'uid-b', ?2, NULL, 1)",
+            params![work, home],
+        )
+        .unwrap();
+
+        // Point the configured collection at neither of them on purpose: if the
+        // drain still routed by configuration, both mocks would go unhit.
+        let configured: Url = format!("{}/configured/", server.base_url())
+            .parse()
+            .unwrap();
+        let http = reqwest::Client::new();
+        let summary = flush_pending(&mut conn, &http, ("u", "p"), &configured)
+            .await
+            .expect("flush");
+
+        assert_eq!(summary.flushed, 2, "both ops should have been dispatched");
+        assert_eq!(summary.newly_errored, 0);
+        work_delete.assert_async().await;
+        home_delete.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn flush_drops_local_ops_without_dispatching_them() {
+        // Local mutations finalize at enqueue time. A local row in the outbox is
+        // debris from an interrupted mutation, and dispatching it would send
+        // "local://default" somewhere.
+        let mut conn = fresh();
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at)
+             VALUES ('delete', 'uid-local', 'local://default', NULL, 0)",
+            [],
+        )
+        .unwrap();
+
+        let configured: Url = "https://server.test/cal/".parse().unwrap();
+        let http = reqwest::Client::new();
+        let summary = flush_pending(&mut conn, &http, ("u", "p"), &configured)
+            .await
+            .expect("flush");
+
+        assert_eq!(summary.flushed, 0);
+        assert_eq!(summary.newly_errored, 0);
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0, "the debris row should have been cleaned up");
     }
 
     #[tokio::test]

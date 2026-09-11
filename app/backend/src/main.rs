@@ -487,6 +487,19 @@ fn active_list_href(db: &Connection) -> anyhow::Result<String> {
     Ok(config::LOCAL_LIST_ID.to_string())
 }
 
+/// The collection a per-task operation must act on.
+///
+/// Resolved from the task's own cache row, not from the selected list: those
+/// coincide only while a single list is visible at a time. Falls back to the
+/// selected list when the UID is not cached at all, so the caller still fails
+/// with its own "no task with uid ..." message rather than a vaguer one here.
+fn collection_for_uid(db: &Connection, uid: &str) -> anyhow::Result<String> {
+    match db::find_collection_for_uid(db, uid)? {
+        Some(href) => Ok(href),
+        None => active_list_href(db),
+    }
+}
+
 fn show_tasks(db: &mut Connection, include_completed: bool) -> anyhow::Result<String> {
     let cal_href = active_list_href(db)?;
 
@@ -1850,7 +1863,7 @@ fn toggle_by_uid(db: &mut Connection, uid: &str) -> anyhow::Result<String> {
         anyhow::bail!("uid cannot be empty");
     }
 
-    let cal_href = active_list_href(db)?;
+    let cal_href = collection_for_uid(db, uid)?;
 
     toggle_by_uid_inner(db, &cal_href, uid)
 }
@@ -1906,7 +1919,7 @@ fn edit_by_uid(db: &mut Connection, payload: &str) -> anyhow::Result<String> {
         anyhow::bail!("summary cannot be empty");
     }
 
-    let cal_href = active_list_href(db)?;
+    let cal_href = collection_for_uid(db, uid)?;
 
     edit_by_uid_inner(db, &cal_href, uid, new_summary, due)
 }
@@ -1949,7 +1962,7 @@ fn delete_by_uid(db: &mut Connection, uid: &str) -> anyhow::Result<String> {
         anyhow::bail!("uid cannot be empty");
     }
 
-    let cal_href = active_list_href(db)?;
+    let cal_href = collection_for_uid(db, uid)?;
 
     delete_by_uid_inner(db, &cal_href, uid)
 }
@@ -2515,7 +2528,10 @@ async fn resolve_first_conflict_inner(
         .context("parsing cached iCalendar (local intent)")?;
     let local_completed = matches!(local.status, nextcloud::TaskStatus::Completed);
 
-    let task_url = queue::build_task_url(calendar_url, &cached.href)?;
+    // The conflict belongs to the op, so its collection comes from the op
+    // too -- not from whichever list happens to be selected.
+    let collection = queue::resolve_collection_url(&op.target_calendar_href, calendar_url)?;
+    let task_url = queue::build_task_url(&collection, &cached.href)?;
     let server = nextcloud::get_task(client, &task_url, auth).await?;
 
     let server_view = match server {
@@ -2658,7 +2674,10 @@ async fn apply_keep_mine_inner(
         ));
     };
 
-    let task_url = queue::build_task_url(calendar_url, &cached.href)?;
+    // The conflict belongs to the op, so its collection comes from the op
+    // too -- not from whichever list happens to be selected.
+    let collection = queue::resolve_collection_url(&op.target_calendar_href, calendar_url)?;
+    let task_url = queue::build_task_url(&collection, &cached.href)?;
     let fresh = nextcloud::get_task(client, &task_url, auth).await?;
     let Some((fresh_etag, _fresh_ical)) = fresh else {
         return Ok(format!(
@@ -2758,7 +2777,10 @@ async fn apply_take_theirs_inner(
         ));
     };
 
-    let task_url = queue::build_task_url(calendar_url, &cached.href)?;
+    // The conflict belongs to the op, so its collection comes from the op
+    // too -- not from whichever list happens to be selected.
+    let collection = queue::resolve_collection_url(&op.target_calendar_href, calendar_url)?;
+    let task_url = queue::build_task_url(&collection, &cached.href)?;
     let fresh = nextcloud::get_task(client, &task_url, auth).await?;
 
     let tx = db.unchecked_transaction()?;
