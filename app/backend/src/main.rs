@@ -14,6 +14,7 @@ mod device;
 mod diagnostics;
 mod nextcloud;
 mod queue;
+mod view;
 
 const MSG_PING: u32 = 1;
 const MSG_TEST_NEXTCLOUD: u32 = 2;
@@ -40,6 +41,7 @@ const MSG_LIST_SOURCES: u32 = 22;
 const MSG_SELECT_SOURCE: u32 = 23;
 const MSG_TRANSFER_TASK: u32 = 24;
 const MSG_GET_DIAGNOSTICS: u32 = 25;
+const MSG_SET_VIEW: u32 = 26;
 const MSG_PONG: u32 = 101;
 const MSG_NEXTCLOUD_RESPONSE: u32 = 102;
 const MSG_CALENDARS_RESPONSE: u32 = 103;
@@ -65,6 +67,7 @@ const MSG_LIST_SOURCES_RESPONSE: u32 = 122;
 const MSG_SELECT_SOURCE_RESPONSE: u32 = 123;
 const MSG_TRANSFER_TASK_RESPONSE: u32 = 124;
 const MSG_GET_DIAGNOSTICS_RESPONSE: u32 = 125;
+const MSG_SET_VIEW_RESPONSE: u32 = 126;
 
 #[tokio::main]
 async fn main() {
@@ -196,13 +199,11 @@ impl AppLoadBackend for Backend {
                 send(replier, MSG_CALENDARS_RESPONSE, &response);
             }
             MSG_SHOW_TASKS => {
-                // Payload "all" includes finished tasks (Show Completed toggle);
-                // anything else (incl. "open"/"") is the default open-only view.
-                let include_completed = msg.contents.trim() == "all";
-                eprintln!(
-                    "retaskable: show tasks requested (include_completed={include_completed})"
-                );
-                let response = match show_tasks(&mut self.db, include_completed) {
+                // The payload used to carry the Show Completed toggle. Filters
+                // are persisted now, so the view is read from config instead and
+                // the payload is ignored -- older senders keep working.
+                eprintln!("retaskable: show tasks requested");
+                let response = match show_tasks(&mut self.db) {
                     Ok(s) => s,
                     Err(e) => format!("error: {e:#}"),
                 };
@@ -398,6 +399,14 @@ impl AppLoadBackend for Backend {
                 };
                 send(replier, MSG_TRANSFER_TASK_RESPONSE, &response);
             }
+            MSG_SET_VIEW => {
+                eprintln!("retaskable: set view {}", msg.contents);
+                let response = match set_view(&msg.contents) {
+                    Ok(s) => s,
+                    Err(e) => format!("error: {e:#}"),
+                };
+                send(replier, MSG_SET_VIEW_RESPONSE, &response);
+            }
             MSG_GET_DIAGNOSTICS => {
                 send(
                     replier,
@@ -507,11 +516,12 @@ fn active_list_href(db: &Connection) -> anyhow::Result<String> {
     Ok(config::LOCAL_LIST_ID.to_string())
 }
 
-fn show_tasks(db: &mut Connection, include_completed: bool) -> anyhow::Result<String> {
+fn show_tasks(db: &mut Connection) -> anyhow::Result<String> {
     let cal_href = active_list_href(db)?;
+    let view = config::load_optional()?.map(|c| c.view).unwrap_or_default();
 
     let tasks = db::list_tasks(db, &cal_href)?;
-    let tasks = nextcloud::filter_for_display(tasks, include_completed);
+    let tasks = view::apply(tasks, &view, &view::today_token());
     let marks = db::pending_marks(db, &cal_href)?;
     let sources = db::source_labels(db, &cal_href)?;
     let anchors = db::source_anchors(db, &cal_href)?;
@@ -528,7 +538,39 @@ fn show_tasks(db: &mut Connection, include_completed: bool) -> anyhow::Result<St
         &anchors,
         last_synced.as_deref(),
         conflicts,
+        &view,
     ))
+}
+
+/// MSG_SET_VIEW handler. Persists the filter state the UI just changed.
+///
+/// `due` and `due_on` are mutually exclusive -- a preset and an exact date
+/// cannot both be active -- so whichever the payload does not specify is
+/// cleared here rather than left to go stale.
+fn set_view(payload: &str) -> anyhow::Result<String> {
+    let v: serde_json::Value = serde_json::from_str(payload)?;
+    let mut cfg = config::load()?;
+    if let Some(include) = v.get("include_completed").and_then(|x| x.as_bool()) {
+        cfg.view.include_completed = include;
+    }
+    let due = v.get("due").and_then(|x| x.as_str()).map(str::trim);
+    let due_on = v.get("due_on").and_then(|x| x.as_str()).map(str::trim);
+    match (due, due_on) {
+        (_, Some(on)) if !on.is_empty() => {
+            cfg.view.due_on = on.to_string();
+            cfg.view.due = String::new();
+        }
+        (Some(rule), _) => {
+            cfg.view.due = rule.to_string();
+            cfg.view.due_on = String::new();
+        }
+        (None, Some(_)) => {
+            cfg.view.due_on = String::new();
+        }
+        (None, None) => {}
+    }
+    config::save(&cfg)?;
+    Ok(serde_json::json!({ "ok": true }).to_string())
 }
 
 fn show_pending(db: &mut Connection) -> anyhow::Result<String> {
@@ -867,7 +909,6 @@ mod tests {
     fn cfg(base_url: &str, calendar: Option<&str>) -> config::Config {
         config::Config {
             active_list: None,
-            ui: config::UiConfig::default(),
             caldav: config::CaldavConfig {
                 provider: "generic".to_string(),
                 base_url: base_url.to_string(),
@@ -876,6 +917,7 @@ mod tests {
                 calendar_href: calendar.map(|s| s.to_string()),
                 calendar: calendar.map(|s| s.to_string()),
             },
+            ..Default::default()
         }
     }
 
@@ -2221,6 +2263,7 @@ fn save_config_inner(db: &mut Connection, payload: &str) -> anyhow::Result<()> {
         // anything it does not own has to be carried across explicitly or a
         // hand-edited `[ui] color` would be silently reset on every save.
         ui: old.as_ref().map(|c| c.ui.clone()).unwrap_or_default(),
+        view: old.as_ref().map(|c| c.view.clone()).unwrap_or_default(),
         caldav: config::CaldavConfig {
             provider,
             base_url,

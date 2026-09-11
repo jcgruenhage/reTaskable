@@ -17,6 +17,10 @@ pub struct Config {
     pub active_list: Option<String>,
     #[serde(default)]
     pub ui: UiConfig,
+    /// Persisted list filters. The list is narrowed by these, not by which
+    /// collection is selected, so a filter survives a restart.
+    #[serde(default)]
+    pub view: ViewConfig,
     /// `nextcloud` is accepted as a read-only compatibility alias for v1.0.x.
     #[serde(alias = "nextcloud")]
     pub caldav: CaldavConfig,
@@ -27,8 +31,36 @@ impl Default for Config {
         Self {
             active_list: Some(LOCAL_LIST_ID.to_string()),
             ui: UiConfig::default(),
+            view: ViewConfig::default(),
             caldav: CaldavConfig::default(),
         }
+    }
+}
+
+/// Filters applied to the task list, persisted so a narrowed list survives a
+/// restart. The UI shows an indicator whenever [`ViewConfig::is_filtered`] is
+/// true, so an unexpectedly short list is always explainable.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ViewConfig {
+    /// Widens the list to include finished tasks. Not a narrowing filter.
+    #[serde(default)]
+    pub include_completed: bool,
+    /// Due-date preset: `""` (no narrowing), `overdue`, `today`, `has`, `none`.
+    #[serde(default)]
+    pub due: String,
+    /// An exact all-day date token (`YYYYMMDD`), set by tapping a due pill.
+    /// Mutually exclusive with `due`; the setter clears whichever is not chosen.
+    #[serde(default)]
+    pub due_on: String,
+}
+
+impl ViewConfig {
+    /// Whether anything is hiding tasks that would otherwise be listed.
+    ///
+    /// `include_completed` is excluded on purpose: it only ever makes the list
+    /// longer, and warning someone that they can see more would be noise.
+    pub fn is_filtered(&self) -> bool {
+        !self.due.is_empty() || !self.due_on.is_empty()
     }
 }
 

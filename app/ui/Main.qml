@@ -20,7 +20,13 @@ Rectangle {
 
     // M10: when false, the list shows only open tasks; when true, finished
     // (completed/cancelled) tasks are included. Drives the MSG 4 payload.
+    // Mirrors of the persisted [view] in config. The backend owns this state and
+    // echoes it back in the task envelope; the UI never keeps its own copy, so
+    // the two cannot drift apart.
     property bool showCompleted: false
+    property string viewDue: ""
+    property string viewDueOn: ""
+    property bool viewFiltered: false
 
     // M14 UX: number of conflict-resolvable errored ops, from the MSG 104
     // envelope. The "Resolve Conflict" button is hidden unless this is > 0, so
@@ -185,7 +191,29 @@ Rectangle {
     // Ask the backend for the list in the current view mode. Open-only by
     // default; "all" includes finished tasks.
     function refreshList() {
-        endpoint.sendMessage(4, root.showCompleted ? "all" : "open")
+        endpoint.sendMessage(4, "")
+    }
+
+    // Persist a change to the view, then reload. The reply carries nothing the
+    // UI needs, because the task envelope that follows re-states the whole view.
+    function setView(patch) {
+        endpoint.sendMessage(26, JSON.stringify(patch))
+        root.refreshList()
+    }
+
+    function clearFilters() {
+        root.setView({ due: "", due_on: "" })
+    }
+
+    // Human-readable description of what is currently hiding tasks, for the
+    // header indicator. Empty when nothing is.
+    function filterLabel() {
+        if (root.viewDueOn.length > 0) return "due " + root.formatDue(root.viewDueOn)
+        if (root.viewDue === "overdue") return "overdue"
+        if (root.viewDue === "today") return "due today"
+        if (root.viewDue === "has") return "has a due date"
+        if (root.viewDue === "none") return "no due date"
+        return ""
     }
 
     function refreshSources() {
@@ -464,6 +492,11 @@ Rectangle {
             })
         }
         root.conflictCount = data.conflicts ? data.conflicts : 0
+        var view = data.view || {}
+        root.showCompleted = view.include_completed === true
+        root.viewDue = view.due ? view.due : ""
+        root.viewDueOn = view.due_on ? view.due_on : ""
+        root.viewFiltered = view.filtered === true
         taskList.contentY = 0
         var synced = data.last_synced ? data.last_synced : "Not yet synced — tap Sync."
         statusText.text = synced + "   (" + tasks.length + (root.showCompleted ? " shown, incl. completed)" : " open)")
@@ -840,10 +873,9 @@ Rectangle {
 
                 MouseArea {
                     anchors.fill: parent
-                    onClicked: {
-                        root.showCompleted = !root.showCompleted
-                        root.refreshList()
-                    }
+                    // The toggle is persisted, so it is set through the backend
+                    // rather than flipped locally; applyTaskList reflects it back.
+                    onClicked: root.setView({ include_completed: !root.showCompleted })
                 }
             }
 
@@ -884,6 +916,73 @@ Rectangle {
                 MouseArea {
                     anchors.fill: parent
                     onClicked: root.pageDown()
+                }
+            }
+        }
+
+        // Filter bar. Each preset is a toggle: tapping the active one clears it,
+        // so there is always a way back to the unfiltered list without hunting
+        // for a separate control.
+        Row {
+            id: filterBar
+            width: parent.width
+            spacing: 12
+
+            Repeater {
+                model: [
+                    { key: "overdue", label: "Overdue" },
+                    { key: "today",   label: "Today" },
+                    { key: "has",     label: "Dated" },
+                    { key: "none",    label: "Undated" }
+                ]
+
+                delegate: Rectangle {
+                    required property var modelData
+                    readonly property bool active: root.viewDue === modelData.key
+                    width: 160
+                    height: 60
+                    color: active ? "black" : "white"
+                    border.color: "black"
+                    border.width: 3
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: parent.modelData.label
+                        font.pixelSize: 22
+                        color: parent.active ? "white" : "black"
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: root.setView({
+                            due: parent.active ? "" : parent.modelData.key,
+                            due_on: ""
+                        })
+                    }
+                }
+            }
+
+            // Shown only while something is actually hidden, and says what --
+            // an unexpectedly short list should never need explaining.
+            Rectangle {
+                visible: root.viewFiltered
+                width: Math.max(260, clearLabel.implicitWidth + 40)
+                height: 60
+                color: "white"
+                border.color: "#c0392b"
+                border.width: 3
+
+                Text {
+                    id: clearLabel
+                    anchors.centerIn: parent
+                    text: "Filtered: " + root.filterLabel() + " ✕"
+                    font.pixelSize: 20
+                    color: "#c0392b"
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: root.clearFilters()
                 }
             }
         }
@@ -1072,11 +1171,24 @@ Rectangle {
                             spacing: 8
 
                             Pill {
+                                id: duePill
                                 visible: root.formatDue(model.due).length > 0
                                 text: root.formatDue(model.due)
                                 colored: root.displayColor
                                 accent: root.dueAccent(model.due)
                                 muted: model.completed
+
+                                // Tap narrows to this exact date. The MouseArea
+                                // sits on the pill and accepts the press, so it
+                                // does not fall through to the row's open-detail
+                                // handler underneath.
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: {
+                                        var token = ("" + model.due).substring(0, 8)
+                                        root.setView({ due_on: token })
+                                    }
+                                }
                             }
                         }
 
@@ -1120,7 +1232,9 @@ Rectangle {
         Text {
             anchors.centerIn: parent
             visible: taskModel.count === 0
-            text: root.showCompleted ? "No tasks." : "No open tasks. Tap Show Completed to review done items."
+            text: root.viewFiltered
+                  ? "No tasks match the " + root.filterLabel() + " filter. Tap Clear to see everything."
+                  : (root.showCompleted ? "No tasks." : "No open tasks. Tap Show Completed to review done items.")
             font.pixelSize: 28
             color: "#303030"
         }
