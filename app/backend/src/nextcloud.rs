@@ -13,6 +13,10 @@ use crate::config::NextcloudConfig;
 pub struct Calendar {
     pub display_name: String,
     pub href: String,
+    /// The server's `calendar-color`, when it exposes one. Apple's namespace is
+    /// the de facto standard here and Nextcloud implements it, so a colour set
+    /// in the web UI carries over instead of being invented on the device.
+    pub color: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -79,11 +83,12 @@ const HOME_SET_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 "#;
 
 const CALENDAR_LIST_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
-<d:propfind xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
+<d:propfind xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:ic="http://apple.com/ns/ical/">
   <d:prop>
     <d:displayname/>
     <d:resourcetype/>
     <cal:supported-calendar-component-set/>
+    <ic:calendar-color/>
   </d:prop>
 </d:propfind>
 "#;
@@ -1538,6 +1543,7 @@ pub fn format_tasks_json(
                     "id": c.id,
                     "name": c.display_name,
                     "kind": c.kind,
+                    "color": c.color,
                 })),
                 "mark": mark,
                 "source": sources.get(&t.uid).cloned().unwrap_or_default(),
@@ -1627,6 +1633,7 @@ fn parse_calendars(xml: &str, base: &Url) -> Result<Vec<Calendar>> {
         let mut is_calendar = false;
         let mut supports_vtodo = false;
         let mut display_name: Option<String> = None;
+        let mut color: Option<String> = None;
 
         for propstat in resp.children().filter(|n| n.has_tag_name("propstat")) {
             if !propstat_is_ok(&propstat) {
@@ -1648,6 +1655,15 @@ fn parse_calendars(xml: &str, base: &Url) -> Result<Vec<Calendar>> {
                     {
                         supports_vtodo = true;
                     }
+                } else if child.has_tag_name("calendar-color") {
+                    // Servers send #RRGGBB or #RRGGBBAA; both are kept verbatim
+                    // and normalised at the point of use, not here.
+                    if let Some(text) = child.text() {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            color = Some(trimmed.to_string());
+                        }
+                    }
                 } else if child.has_tag_name("displayname") {
                     if let Some(text) = child.text() {
                         let trimmed = text.trim();
@@ -1663,6 +1679,7 @@ fn parse_calendars(xml: &str, base: &Url) -> Result<Vec<Calendar>> {
             out.push(Calendar {
                 display_name: display_name.unwrap_or_else(|| href.to_string()),
                 href: href.to_string(),
+                color,
             });
         }
     }

@@ -454,6 +454,9 @@ fn list_sources(db: &Connection) -> anyhow::Result<String> {
         "color": display.color,
         "device": display.model,
         "default_target": config::default_target(&config::load_optional()?.unwrap_or_default()),
+        // Which collections are being synced, so Settings can show the current
+        // selection without deriving it from the cache.
+        "synced": config::synced_collections(&config::load_optional()?.unwrap_or_default()),
     })
     .to_string())
 }
@@ -1007,6 +1010,22 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(drain_intake_from(&mut conn, &dir, "/cal/").unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_guard_prompts_only_when_a_retarget_would_destroy_queued_work() {
+        // Retarget, queued work, no acknowledgement yet: refuse and report.
+        assert!(matches!(
+            save_guard(true, false, 3),
+            Some(SaveOutcome::NeedsConfirm { pending_count: 3 })
+        ));
+        // Acknowledged: the caller has been told, let it through.
+        assert!(save_guard(true, true, 3).is_none());
+        // Retarget with an empty queue: nothing is at risk, never prompt.
+        assert!(save_guard(true, false, 0).is_none());
+        // Same target -- a password-only edit, say. reset_cache won't run, so
+        // however deep the queue is it is not at risk and must not nag.
+        assert!(save_guard(false, false, 42).is_none());
     }
 
     fn cfg(base_url: &str, calendar: Option<&str>) -> config::Config {
@@ -1880,43 +1899,101 @@ async fn sync(db: &mut Connection) -> anyhow::Result<String> {
         return Ok("Local tasks saved. No CalDAV account configured.".to_string());
     }
 
-    let calendars = nextcloud::discover_calendars(&cfg.caldav).await?;
-    let cal = if let Some(href) = cfg.caldav.calendar_href.as_deref() {
-        calendars.iter().find(|c| c.href == href)
-    } else if let Some(name) = cfg.caldav.calendar.as_deref() {
-        calendars.iter().find(|c| c.display_name == name)
-    } else {
-        None
-    }
-    .ok_or_else(|| {
-        let names: Vec<&str> = calendars.iter().map(|c| c.display_name.as_str()).collect();
-        anyhow::anyhow!(
-            "configured task list not found among discovered calendars: {:?}",
+    let discovered = nextcloud::discover_calendars(&cfg.caldav).await?;
+    let wanted = config::synced_collections(&cfg);
+    let selected: Vec<&nextcloud::Calendar> = discovered
+        .iter()
+        .filter(|c| wanted.iter().any(|href| href == &c.href))
+        .collect();
+    if selected.is_empty() {
+        let names: Vec<&str> = discovered.iter().map(|c| c.display_name.as_str()).collect();
+        anyhow::bail!(
+            "none of the selected task lists were found among discovered calendars: {:?}",
             names
-        )
-    })?;
+        );
+    }
 
-    db::upsert_calendar(db, &cal.href, &cal.display_name)?;
+    for cal in &selected {
+        db::upsert_calendar(db, &cal.href, &cal.display_name, cal.color.as_deref())?;
+    }
 
-    let calendar_url = url::Url::parse(&cal.href)?;
     let client = nextcloud::dav_client()?;
     let auth = (
         cfg.caldav.username.as_str(),
         cfg.caldav.app_password.as_str(),
     );
 
-    // --- Phase 1: drain the queue ---
-    let flush = queue::flush_pending(db, &client, auth, &calendar_url).await?;
+    // --- Phase 1: drain the queue, once for every collection ---
+    //
+    // The outbox is global and each op now carries its own destination, so this
+    // is a single pass rather than one per collection. The URL passed here is
+    // only the base for resolving a legacy path-shaped href; the first selected
+    // collection serves as well as any.
+    let fallback = url::Url::parse(&selected[0].href)?;
+    let flush = queue::flush_pending(db, &client, auth, &fallback).await?;
 
-    // Phase 4 invariant: flush_pending stops at the first transient, so this is 0 or 1.
+    // flush_pending stops at the first transient failure, so this is 0 or 1.
     if flush.transient_failed > 0 {
         return Ok(compose_sync_response(&flush, None, 0, 0));
     }
 
-    // --- Phase 2: sync-collection REPORT (unchanged from M4) ---
+    // --- Phase 2: pull each collection in turn ---
+    //
+    // One unreachable or misconfigured collection must not cost the user the
+    // others, so a failure is collected and reported rather than propagated.
+    let mut updated = 0;
+    let mut deleted = 0;
+    let mut kinds: Vec<&'static str> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+
+    for cal in &selected {
+        match sync_collection(db, &client, auth, cal).await {
+            Ok((kind, u, d)) => {
+                updated += u;
+                deleted += d;
+                kinds.push(kind);
+            }
+            Err(e) => {
+                eprintln!("retaskable: sync of {} failed: {e:#}", cal.display_name);
+                failures.push(format!("{}: {e:#}", cal.display_name));
+            }
+        }
+    }
+
+    let kind = if kinds.is_empty() {
+        None
+    } else if kinds.iter().all(|k| *k == "full") {
+        Some("full")
+    } else if kinds.iter().all(|k| *k == "incremental") {
+        Some("incremental")
+    } else {
+        Some("mixed")
+    };
+
+    let mut response = compose_sync_response(&flush, kind, updated, deleted);
+    if !failures.is_empty() {
+        response.push_str(&format!(
+            " {} of {} list(s) failed: {}",
+            failures.len(),
+            selected.len(),
+            failures.join("; ")
+        ));
+    }
+    Ok(response)
+}
+
+/// Pull one collection: REPORT, reconcile the cache, record the sync token.
+/// Returns the sync kind plus how many rows it touched.
+async fn sync_collection(
+    db: &mut Connection,
+    client: &reqwest::Client,
+    auth: (&str, &str),
+    cal: &nextcloud::Calendar,
+) -> anyhow::Result<(&'static str, usize, usize)> {
+    let calendar_url = url::Url::parse(&cal.href)?;
     let prior_token = db::get_sync_token(db, &cal.href)?;
     let (delta, was_full) = nextcloud::sync_collection_with_fallback(
-        &client,
+        client,
         &calendar_url,
         prior_token.as_deref(),
         auth,
@@ -1927,8 +2004,8 @@ async fn sync(db: &mut Connection) -> anyhow::Result<String> {
     let mut deleted = 0;
 
     if was_full {
-        // Full sync: server returned every resource. Reconcile by deleting
-        // anything we hold locally that wasn't in the response.
+        // Full sync: the server returned every resource, so anything held
+        // locally that is absent from the response is gone.
         let kept: std::collections::HashSet<String> = delta
             .added_or_updated
             .iter()
@@ -1969,16 +2046,15 @@ async fn sync(db: &mut Connection) -> anyhow::Result<String> {
     if let Some(token) = &delta.new_sync_token {
         db::set_sync_token(db, &cal.href, token, SystemTime::now())?;
     } else if was_full {
-        // No sync-token: either Nextcloud omitted it, or this is the
+        // No sync-token: either the server omitted it, or this was the
         // calendar-query fallback for a server without WebDAV-Sync. Clear any
-        // stale token so the next pass stays full, but still record the sync
-        // time so the UI shows "Last synced …" instead of "Not yet synced".
+        // stale token so the next pass stays full, but still record the time so
+        // the UI shows "Synced ..." rather than "Not yet synced".
         db::clear_sync_token(db, &cal.href)?;
         db::set_last_synced(db, &cal.href, SystemTime::now())?;
     }
 
-    let kind = if was_full { "full" } else { "incremental" };
-    Ok(compose_sync_response(&flush, Some(kind), updated, deleted))
+    Ok((if was_full { "full" } else { "incremental" }, updated, deleted))
 }
 
 fn toggle_first(db: &mut Connection) -> anyhow::Result<String> {
@@ -2290,14 +2366,46 @@ fn format_discover_error(err: &anyhow::Error) -> String {
 /// MSG_SAVE_CONFIG handler. Writes the new config (blank password keeps the
 /// existing one) and resets the cache only when the target changed. Returns
 /// `{ok: true}` or `{ok: false, error}`.
+/// Outcome of a Settings save.
+///
+/// Changing the collection calls `reset_cache`, whose first statement deletes
+/// every `pending_op` row -- so an otherwise ordinary save can silently destroy
+/// queued offline edits. When there is queued work, the save is refused and the
+/// UI is told what it would cost; it re-sends with `discard_pending` once the
+/// user has acknowledged it.
+enum SaveOutcome {
+    Saved,
+    NeedsConfirm { pending_count: i64 },
+}
+
 fn save_config(db: &mut Connection, payload: &str) -> String {
     match save_config_inner(db, payload) {
-        Ok(()) => serde_json::json!({ "ok": true }).to_string(),
+        Ok(SaveOutcome::Saved) => serde_json::json!({ "ok": true }).to_string(),
+        Ok(SaveOutcome::NeedsConfirm { pending_count }) => serde_json::json!({
+            "ok": false,
+            "needs_confirm": true,
+            "pending_count": pending_count,
+        })
+        .to_string(),
         Err(e) => serde_json::json!({ "ok": false, "error": format!("{e:#}") }).to_string(),
     }
 }
 
-fn save_config_inner(db: &mut Connection, payload: &str) -> anyhow::Result<()> {
+/// Decide whether a save may proceed, given whether it retargets the account,
+/// whether the user has acknowledged the loss, and how much is queued.
+///
+/// Kept separate from the I/O so the truth table is testable. The case worth
+/// naming: an unchanged target never prompts, however deep the queue is, so
+/// updating only a password doesn't nag about work that isn't at risk.
+fn save_guard(changed: bool, discard_ack: bool, pending_count: i64) -> Option<SaveOutcome> {
+    if changed && !discard_ack && pending_count > 0 {
+        Some(SaveOutcome::NeedsConfirm { pending_count })
+    } else {
+        None
+    }
+}
+
+fn save_config_inner(db: &mut Connection, payload: &str) -> anyhow::Result<SaveOutcome> {
     let v: serde_json::Value = serde_json::from_str(payload)?;
     let provider = v
         .get("provider")
@@ -2351,6 +2459,50 @@ fn save_config_inner(db: &mut Connection, payload: &str) -> anyhow::Result<()> {
         anyhow::bail!("an app password is required when the CalDAV account changes");
     }
     let changed = target_changed(old.as_ref(), &base_url, &calendar_href);
+    let discard_ack = v
+        .get("discard_pending")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+
+    // The synced set the form is submitting. Absent means "unchanged", so an
+    // older sender that only knows about a single collection still works.
+    let submitted_synced: Option<Vec<String>> = v.get("synced").and_then(|x| x.as_array()).map(|a| {
+        a.iter()
+            .filter_map(|c| c.as_str())
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string)
+            .collect()
+    });
+    let previously_synced = old
+        .as_ref()
+        .map(config::synced_collections)
+        .unwrap_or_default();
+    let removed: Vec<String> = match &submitted_synced {
+        Some(now) => previously_synced
+            .iter()
+            .filter(|href| !now.iter().any(|kept| kept == *href))
+            .cloned()
+            .collect(),
+        None => Vec::new(),
+    };
+
+    // Queued work that this save would destroy: everything, if the account
+    // itself is changing; otherwise only what belongs to collections being
+    // dropped. Refuse before writing anything -- a refused save must leave the
+    // config and the queue exactly as they were.
+    let at_risk = if changed {
+        db::count_pending_ops(db)?
+    } else {
+        let mut total = 0;
+        for href in &removed {
+            total += db::count_pending_ops_for(db, href)?;
+        }
+        total
+    };
+    if let Some(outcome) = save_guard(changed || !removed.is_empty(), discard_ack, at_risk) {
+        return Ok(outcome);
+    }
     let active_list = v
         .get("active_list")
         .and_then(|x| x.as_str())
@@ -2367,7 +2519,13 @@ fn save_config_inner(db: &mut Connection, payload: &str) -> anyhow::Result<()> {
         // hand-edited `[ui] color` would be silently reset on every save.
         ui: old.as_ref().map(|c| c.ui.clone()).unwrap_or_default(),
         view: old.as_ref().map(|c| c.view.clone()).unwrap_or_default(),
-        lists: old.as_ref().map(|c| c.lists.clone()).unwrap_or_default(),
+        lists: {
+            let mut lists = old.as_ref().map(|c| c.lists.clone()).unwrap_or_default();
+            if let Some(now) = submitted_synced.clone() {
+                lists.synced = now;
+            }
+            lists
+        },
         caldav: config::CaldavConfig {
             provider,
             base_url,
@@ -2379,9 +2537,20 @@ fn save_config_inner(db: &mut Connection, payload: &str) -> anyhow::Result<()> {
     };
     config::save(&cfg)?;
     if changed {
+        // The account itself moved, so nothing cached still refers to anything
+        // real.
         db::reset_cache(db)?;
+    } else {
+        // Otherwise drop only what was deselected: the collections still in the
+        // set keep their cache, their sync tokens and their queue.
+        for href in &removed {
+            let dropped = db::forget_collection(db, href)?;
+            eprintln!(
+                "retaskable: dropped collection {href} ({dropped} queued op(s) discarded)"
+            );
+        }
     }
-    Ok(())
+    Ok(SaveOutcome::Saved)
 }
 
 /// MSG_DISCOVER_WITH handler. Validates the provided credentials by listing the

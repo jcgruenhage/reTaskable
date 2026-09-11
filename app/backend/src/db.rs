@@ -44,7 +44,7 @@ pub struct PendingOpView {
 pub const LOCAL_LIST_ID: &str = "local://default";
 pub const LOCAL_LIST_NAME: &str = "On This reMarkable";
 
-const SCHEMA_V4: &str = "
+const SCHEMA_V5: &str = "
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -54,6 +54,10 @@ CREATE TABLE IF NOT EXISTS calendar (
     href TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
     kind TEXT NOT NULL DEFAULT 'caldav',
+    -- The server's own calendar-color, as an #RRGGBB(AA) string. Kept as the
+    -- server sent it so a colour set once in Nextcloud carries over rather than
+    -- being invented locally.
+    color TEXT,
     sync_token TEXT,
     last_synced_at INTEGER
 );
@@ -93,7 +97,7 @@ CREATE TABLE IF NOT EXISTS pending_op (
 CREATE INDEX IF NOT EXISTS idx_pending_op_drain ON pending_op(errored, id);
 ";
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 pub fn path() -> Result<PathBuf> {
     let base = dirs::data_dir().context("could not resolve user data dir")?;
@@ -160,13 +164,17 @@ fn configure_connection(conn: &Connection) -> Result<()> {
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
     let current = read_schema_version(conn)?;
     if current <= 1 {
-        migrate_fresh_or_legacy_to_v4(conn)
+        migrate_fresh_or_legacy_to_v5(conn)
             .with_context(|| format!("migrating db from v{current} to v{SCHEMA_VERSION}"))?;
     } else if current == 2 {
         migrate_v2_to_v3(conn).context("migrating db from v2 to v3")?;
         migrate_v3_to_v4(conn).context("migrating db from v3 to v4")?;
+        migrate_v4_to_v5(conn).context("migrating db from v4 to v5")?;
     } else if current == 3 {
         migrate_v3_to_v4(conn).context("migrating db from v3 to v4")?;
+        migrate_v4_to_v5(conn).context("migrating db from v4 to v5")?;
+    } else if current == 4 {
+        migrate_v4_to_v5(conn).context("migrating db from v4 to v5")?;
     } else if current != SCHEMA_VERSION {
         anyhow::bail!(
             "unsupported database schema v{current}; this build supports v{SCHEMA_VERSION}"
@@ -203,7 +211,7 @@ fn read_schema_version(conn: &Connection) -> Result<i64> {
     Ok(v.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0))
 }
 
-fn migrate_fresh_or_legacy_to_v4(conn: &Connection) -> Result<()> {
+fn migrate_fresh_or_legacy_to_v5(conn: &Connection) -> Result<()> {
     // v1 never contained a durable offline queue and was previously treated as
     // disposable cache. Preserve the historical behavior only for v0/v1;
     // v2 and later use non-destructive migrations below.
@@ -217,8 +225,8 @@ fn migrate_fresh_or_legacy_to_v4(conn: &Connection) -> Result<()> {
          DROP TABLE IF EXISTS meta;",
     )
     .context("dropping pre-v2 tables")?;
-    conn.execute_batch(SCHEMA_V4)
-        .context("applying v4 schema")?;
+    conn.execute_batch(SCHEMA_V5)
+        .context("applying v5 schema")?;
     conn.execute(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
         params![SCHEMA_VERSION.to_string()],
@@ -272,6 +280,17 @@ fn migrate_v3_to_v4(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    tx.execute("UPDATE meta SET value = '4' WHERE key = 'schema_version'", [])?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Add the cached collection colour. Nothing to backfill: the value is only
+/// known once discovery has run, and the next sync fills it in.
+fn migrate_v4_to_v5(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("ALTER TABLE calendar ADD COLUMN color TEXT", [])
+        .context("adding calendar.color")?;
     tx.execute(
         "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
         params![SCHEMA_VERSION.to_string()],
@@ -326,13 +345,24 @@ pub fn ensure_local_list(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub fn upsert_calendar(conn: &Connection, href: &str, display_name: &str) -> Result<()> {
+/// Record a discovered collection.
+///
+/// `color` is `None` when the server exposes none; the stored value is then
+/// left alone rather than cleared, so a colour that was discovered once
+/// survives a server that stops reporting it.
+pub fn upsert_calendar(
+    conn: &Connection,
+    href: &str,
+    display_name: &str,
+    color: Option<&str>,
+) -> Result<()> {
     conn.execute(
-        "INSERT INTO calendar (href, display_name, kind) VALUES (?1, ?2, 'caldav')
+        "INSERT INTO calendar (href, display_name, kind, color) VALUES (?1, ?2, 'caldav', ?3)
          ON CONFLICT(href) DO UPDATE SET
             display_name = excluded.display_name,
-            kind = CASE WHEN calendar.kind = 'local' THEN 'local' ELSE 'caldav' END",
-        params![href, display_name],
+            kind = CASE WHEN calendar.kind = 'local' THEN 'local' ELSE 'caldav' END,
+            color = COALESCE(excluded.color, calendar.color)",
+        params![href, display_name, color],
     )?;
     Ok(())
 }
@@ -342,11 +372,12 @@ pub struct TaskList {
     pub id: String,
     pub display_name: String,
     pub kind: String,
+    pub color: Option<String>,
 }
 
 pub fn list_calendars(conn: &Connection) -> Result<Vec<TaskList>> {
     let mut stmt = conn.prepare(
-        "SELECT href, display_name, kind
+        "SELECT href, display_name, kind, color
            FROM calendar
           ORDER BY CASE kind WHEN 'local' THEN 0 ELSE 1 END, display_name, href",
     )?;
@@ -355,6 +386,7 @@ pub fn list_calendars(conn: &Connection) -> Result<Vec<TaskList>> {
             id: row.get(0)?,
             display_name: row.get(1)?,
             kind: row.get(2)?,
+            color: row.get(3)?,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1147,6 +1179,16 @@ pub fn count_resolvable_conflicts(conn: &Connection) -> Result<i64> {
     Ok(n)
 }
 
+/// Total queued operations, errored or not.
+///
+/// Distinct from [`count_resolvable_conflicts`], which counts only the subset a
+/// user can act on: this counts everything the queue still owes the server,
+/// because `reset_cache` destroys all of it indiscriminately.
+pub fn count_pending_ops(conn: &Connection) -> Result<i64> {
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0))?;
+    Ok(n)
+}
+
 /// Look up a single pending_op row by id. Used by the M9b conflict
 /// resolution path to verify an op is still resolvable between the user's
 /// "Resolve" tap and their "Keep Mine" / "Take Theirs" tap (the op could
@@ -1211,6 +1253,37 @@ pub fn get_cached_task_by_uid(
 /// sync target (server URL or calendar) changes via Settings (M11). Clears the
 /// task cache, the offline-op queue, and the calendar table (which carries the
 /// `sync_token` + `last_synced_at`); leaves `meta` (schema version) intact.
+/// Drop one collection: its cached tasks, its queued operations, and its
+/// calendar row.
+///
+/// Narrower than [`reset_cache`] on purpose. Removing one collection from the
+/// synced set must not cost the user the others, which is exactly what a
+/// whole-cache reset would do once more than one collection exists.
+///
+/// Returns how many queued operations were discarded, so the caller can report
+/// it rather than deleting work silently.
+pub fn forget_collection(conn: &mut Connection, href: &str) -> Result<usize> {
+    let tx = conn.transaction()?;
+    let dropped = tx.execute(
+        "DELETE FROM pending_op WHERE target_calendar_href = ?1",
+        params![href],
+    )?;
+    tx.execute("DELETE FROM task WHERE calendar_href = ?1", params![href])?;
+    tx.execute("DELETE FROM calendar WHERE href = ?1", params![href])?;
+    tx.commit()?;
+    Ok(dropped)
+}
+
+/// Queued operations belonging to one collection.
+pub fn count_pending_ops_for(conn: &Connection, href: &str) -> Result<i64> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pending_op WHERE target_calendar_href = ?1",
+        params![href],
+        |r| r.get(0),
+    )?;
+    Ok(n)
+}
+
 pub fn reset_cache(conn: &Connection) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     // Local operations never belong in the outbox. Delete every outbox row so
@@ -1496,7 +1569,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_from_empty_db_creates_v4_layout() {
+    fn migration_from_empty_db_creates_v5_layout() {
         let conn = fresh();
         ensure_schema_v2(&conn).expect("migrate");
         // meta table populated
@@ -1507,7 +1580,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, "4");
+        assert_eq!(version, "5");
         // new task columns exist
         let cols: Vec<String> = conn
             .prepare("PRAGMA table_info(task)")
@@ -1665,7 +1738,7 @@ mod tests {
                 |r| { r.get::<_, String>(0) }
             )
             .unwrap(),
-            "4"
+            "5"
         );
         assert_eq!(
             conn.query_row("SELECT kind FROM calendar WHERE href='/cal/'", [], |r| {
@@ -2961,6 +3034,71 @@ mod tests {
     }
 
     #[test]
+    fn forget_collection_leaves_the_other_collections_intact() {
+        // Deselecting one collection must not cost the user the others, which
+        // is precisely what a whole-cache reset would do.
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        upsert_calendar(&conn, "https://s.test/work/", "Work", Some("#ff0000")).unwrap();
+        upsert_calendar(&conn, "https://s.test/home/", "Home", None).unwrap();
+        conn.execute(
+            "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, uid)
+             VALUES ('https://s.test/work/', '/work/a.ics', 'e', 'i', 'A', 'needs-action', 'uid-a'),
+                    ('https://s.test/home/', '/home/b.ics', 'e', 'i', 'B', 'needs-action', 'uid-b')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at)
+             VALUES ('toggle', 'uid-a', 'https://s.test/work/', NULL, 0),
+                    ('toggle', 'uid-b', 'https://s.test/home/', NULL, 1)",
+            [],
+        )
+        .unwrap();
+
+        let dropped = forget_collection(&mut conn, "https://s.test/work/").unwrap();
+        assert_eq!(dropped, 1, "its queued op is reported, not silently deleted");
+
+        assert!(list_tasks(&conn, "https://s.test/work/").unwrap().is_empty());
+        assert_eq!(list_tasks(&conn, "https://s.test/home/").unwrap().len(), 1);
+        assert_eq!(count_pending_ops(&conn).unwrap(), 1);
+        assert!(!calendar_exists(&conn, "https://s.test/work/").unwrap());
+        assert!(calendar_exists(&conn, "https://s.test/home/").unwrap());
+    }
+
+    #[test]
+    fn upsert_calendar_keeps_a_colour_the_server_stops_reporting() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        upsert_calendar(&conn, "https://s.test/work/", "Work", Some("#336699")).unwrap();
+        // A later discovery that omits the colour must not wipe it.
+        upsert_calendar(&conn, "https://s.test/work/", "Work", None).unwrap();
+        let work = list_calendars(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == "https://s.test/work/")
+            .expect("collection");
+        assert_eq!(work.color.as_deref(), Some("#336699"));
+    }
+
+    #[test]
+    fn count_pending_ops_counts_errored_and_clean_alike() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        assert_eq!(count_pending_ops(&conn).unwrap(), 0);
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at, errored, last_error)
+             VALUES ('toggle', 'a', '/cal/', NULL, 100, 0, NULL),
+                    ('edit',   'b', '/cal/', NULL, 101, 1, 'HTTP 401 Unauthorized')",
+            [],
+        )
+        .unwrap();
+        // reset_cache deletes both regardless of state, so both are at risk and
+        // both have to be reported.
+        assert_eq!(count_pending_ops(&conn).unwrap(), 2);
+    }
+
+    #[test]
     fn count_resolvable_conflicts_matches_first_resolvable_predicate() {
         let conn = fresh();
         ensure_schema_v2(&conn).expect("migrate");
@@ -3126,7 +3264,7 @@ mod tests {
         ensure_schema(&conn).unwrap();
         ensure_local_list(&conn).unwrap();
         create_local_with_anchor(&mut conn, "local-1", "Keep me", None, None).unwrap();
-        upsert_calendar(&conn, "https://example.test/tasks/", "Remote").unwrap();
+        upsert_calendar(&conn, "https://example.test/tasks/", "Remote", None).unwrap();
         reset_cache(&conn).unwrap();
         assert_eq!(list_tasks(&conn, LOCAL_LIST_ID).unwrap().len(), 1);
         let lists = list_calendars(&conn).unwrap();
@@ -3141,7 +3279,7 @@ mod tests {
         ensure_local_list(&conn).unwrap();
         create_local_with_anchor(&mut conn, "local-1", "Move me", None, None).unwrap();
         let remote = "https://example.test/tasks/";
-        upsert_calendar(&conn, remote, "Remote").unwrap();
+        upsert_calendar(&conn, remote, "Remote", None).unwrap();
         let op = transfer_local_to_remote(&mut conn, "local-1", remote, true).unwrap();
         assert!(op > 0);
         assert!(get_cached_task_by_uid(&conn, LOCAL_LIST_ID, "local-1")
@@ -3160,7 +3298,7 @@ mod tests {
         ensure_local_list(&conn).unwrap();
         create_local_with_anchor(&mut conn, "local-1", "Move me", None, None).unwrap();
         let remote = "https://example.test/tasks/";
-        upsert_calendar(&conn, remote, "Remote").unwrap();
+        upsert_calendar(&conn, remote, "Remote", None).unwrap();
 
         let copy_id = transfer_local_to_remote(&mut conn, "local-1", remote, false).unwrap();
         let move_id = transfer_local_to_remote(&mut conn, "local-1", remote, true).unwrap();

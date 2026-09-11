@@ -48,6 +48,11 @@ impl Default for Config {
 /// setting only because exactly one list was ever visible.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ListsConfig {
+    /// Collection hrefs to sync. Empty means "fall back to the single
+    /// `caldav.calendar_href`", which is how a pre-multi-collection config keeps
+    /// syncing exactly what it synced before.
+    #[serde(default)]
+    pub synced: Vec<String>,
     /// Collection new tasks are created in. May be [`LOCAL_LIST_ID`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_target: Option<String>,
@@ -218,6 +223,31 @@ pub fn active_list(cfg: &Config) -> Option<&str> {
         .or(cfg.caldav.calendar_href.as_deref())
 }
 
+/// Remote collection hrefs to sync.
+///
+/// An upgrade from a single-collection config has no `[lists]` table, so it
+/// degrades to the one collection already selected: syncing must not silently
+/// change scope underneath someone who never asked for more than one.
+pub fn synced_collections(cfg: &Config) -> Vec<String> {
+    if !cfg.lists.synced.is_empty() {
+        // The user's order is preserved; dedupe without sorting, and drop the
+        // local list if it leaked in -- it has no server side to sync against.
+        let mut seen = std::collections::HashSet::new();
+        return cfg
+            .lists
+            .synced
+            .iter()
+            .filter(|href| !href.is_empty() && href.as_str() != LOCAL_LIST_ID)
+            .filter(|href| seen.insert(href.as_str()))
+            .cloned()
+            .collect();
+    }
+    match cfg.caldav.calendar_href.as_deref() {
+        Some(href) if !href.is_empty() => vec![href.to_string()],
+        _ => Vec::new(),
+    }
+}
+
 /// The collection new tasks are created in.
 ///
 /// Falls back through the pre-merge single-selection field and finally to the
@@ -302,6 +332,51 @@ mod tests {
             toml::from_str(&std::fs::read_to_string(&path).unwrap()).expect("parse");
         assert!(parsed.caldav.calendar.is_none());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_single_collection_config_keeps_syncing_exactly_that_one() {
+        // The upgrade path that matters: no [lists] table at all, so the one
+        // collection already selected stays the whole synced set. Widening the
+        // scope underneath someone who never asked for it would be worse than
+        // doing nothing.
+        let legacy: Config = toml::from_str(
+            r#"active_list = "https://nc.test/tasks/work/"
+
+[caldav]
+base_url = "https://nc.test"
+username = "u"
+app_password = "p"
+calendar_href = "https://nc.test/tasks/work/"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            synced_collections(&legacy),
+            vec!["https://nc.test/tasks/work/".to_string()]
+        );
+        assert!(synced_collections(&Config::default()).is_empty());
+    }
+
+    #[test]
+    fn synced_collections_dedupes_in_place_and_drops_the_local_list() {
+        let cfg: Config = toml::from_str(
+            r#"[lists]
+synced = ["https://b/", "https://a/", "https://b/", "local://default", ""]
+
+[caldav]
+base_url = "https://b"
+username = "u"
+app_password = "p"
+"#,
+        )
+        .unwrap();
+        // Order is the user's, the duplicate goes, and the local list is
+        // excluded -- it has no server side to sync against.
+        assert_eq!(
+            synced_collections(&cfg),
+            vec!["https://b/".to_string(), "https://a/".to_string()]
+        );
     }
 
     #[test]

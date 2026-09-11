@@ -71,6 +71,10 @@ Rectangle {
     property string settingsLoadedUrl: ""
     property string settingsLoadedUsername: ""
     property bool settingsLoadedHasPassword: false
+    // Collections selected for syncing. `selectedCalendar*` is retained as the
+    // first of them, so the config keeps a single-collection field that an
+    // older build can still read.
+    property var syncedHrefs: []
     property string selectedCalendar: ""
     property string selectedCalendarHref: ""
     property string activeListId: "local://default"
@@ -84,6 +88,11 @@ Rectangle {
     // calendar discovery — Save is blocked until the user re-Tests, so we never
     // persist a calendar that doesn't exist on the (new) server.
     property bool needsDiscover: false
+    // Changing the collection wipes the offline queue, so the backend refuses
+    // the first save and reports what would be lost. Armed until the user
+    // either confirms the loss or backs out.
+    property bool settingsDiscardArmed: false
+    property int settingsPendingCount: 0
     property bool createReady: false
 
     // M10: the task list is a structured ListModel populated from the JSON
@@ -295,6 +304,7 @@ Rectangle {
         root.activeListId = data.active ? data.active : "local://default"
         root.displayColor = data.color === true
         root.createTargetId = data.default_target ? data.default_target : "local://default"
+        root.syncedHrefs = data.synced ? data.synced : []
         root.remoteDestinationId = ""
         var sources = data.sources || []
         for (var i = 0; i < sources.length; i++) {
@@ -352,6 +362,8 @@ Rectangle {
     // ---- M11: settings flow ----
     function openSettings() {
         root.settingsOpen = true
+        root.settingsDiscardArmed = false
+        root.settingsPendingCount = 0
         settingsStatus.text = ""
         syncErrorsStatus.text = ""
         calendarsModel.clear()
@@ -421,19 +433,67 @@ Rectangle {
                 stillValid = true
             }
         }
-        // If the previously-selected calendar isn't on this server, drop it
-        // (auto-pick when there's exactly one) so we can't save a stale choice.
-        if (!stillValid) {
-            root.selectedCalendar = (cals.length === 1) ? cals[0].display_name : ""
-            root.selectedCalendarHref = (cals.length === 1) ? cals[0].href : ""
+        // Prune the synced set to what this server actually offers, so a stale
+        // selection can't be saved. A collection dropped here is only removed
+        // from the *form*; nothing is discarded until Save, which is where the
+        // confirmation lives.
+        var keptSynced = []
+        for (var k = 0; k < root.syncedHrefs.length; k++) {
+            for (var c = 0; c < cals.length; c++) {
+                if (cals[c].href === root.syncedHrefs[k]) {
+                    keptSynced.push(root.syncedHrefs[k])
+                    break
+                }
+            }
+        }
+        // Nothing survived and there is exactly one candidate: pick it, so the
+        // common single-collection setup still needs no decision.
+        if (keptSynced.length === 0 && cals.length === 1) {
+            keptSynced.push(cals[0].href)
+        }
+        root.syncedHrefs = keptSynced
+        if (!stillValid || keptSynced.indexOf(root.selectedCalendarHref) === -1) {
+            root.selectedCalendarHref = keptSynced.length > 0 ? keptSynced[0] : ""
+            root.selectedCalendar = keptSynced.length > 0
+                ? root.calendarNameFor(keptSynced[0]) : ""
         }
         root.needsDiscover = false
         settingsStatus.text = "Found " + cals.length + " calendar(s). "
-            + (root.selectedCalendar ? "Selected: " + root.selectedCalendar + "."
-                                     : "Pick one, then Save.")
+            + (root.syncedHrefs.length > 0
+               ? "Syncing " + root.syncedHrefs.length + "."
+               : "Pick at least one, then Save.")
     }
 
-    function saveSettings() {
+    // `discardPending` is only ever true on the second, deliberate tap: the
+    // plain Save button never sends it, so no ordinary save can destroy the queue.
+    function toggleSynced(href, displayName) {
+        var next = []
+        var found = false
+        for (var i = 0; i < root.syncedHrefs.length; i++) {
+            if (root.syncedHrefs[i] === href) { found = true; continue }
+            next.push(root.syncedHrefs[i])
+        }
+        if (!found) next.push(href)
+        root.syncedHrefs = next
+        // Keep the legacy single-collection fields pointing at the first
+        // selection so a downgrade still finds something coherent.
+        if (next.length > 0) {
+            root.selectedCalendarHref = next[0]
+            root.selectedCalendar = root.calendarNameFor(next[0])
+        } else {
+            root.selectedCalendarHref = ""
+            root.selectedCalendar = ""
+        }
+    }
+
+    function calendarNameFor(href) {
+        for (var i = 0; i < calendarsModel.count; i++) {
+            if (calendarsModel.get(i).href === href) return calendarsModel.get(i).display_name
+        }
+        return href
+    }
+
+    function saveSettings(discardPending) {
         settingsStatus.text = "Saving…"
         endpoint.sendMessage(16, JSON.stringify({
             provider: root.settingsProvider,
@@ -442,7 +502,9 @@ Rectangle {
             app_password: settingsPass.text,
             calendar: root.selectedCalendar,
             calendar_href: root.selectedCalendarHref,
-            active_list: root.selectedCalendarHref
+            active_list: root.selectedCalendarHref,
+            synced: root.syncedHrefs,
+            discard_pending: discardPending === true
         }))
     }
 
@@ -454,10 +516,19 @@ Rectangle {
             settingsStatus.text = jsonText
             return
         }
+        if (r.needs_confirm === true) {
+            root.settingsPendingCount = r.pending_count ? r.pending_count : 0
+            root.settingsDiscardArmed = true
+            settingsStatus.text = "Changing the task list discards "
+                + root.settingsPendingCount
+                + " change(s) that haven't reached the server yet. Nothing has been saved."
+            return
+        }
         if (!r.ok) {
             settingsStatus.text = "Error: " + (r.error ? r.error : "save failed")
             return
         }
+        root.settingsDiscardArmed = false
         root.settingsOpen = false
         root.createReady = false
         statusText.text = "Settings saved. Syncing…"
@@ -557,6 +628,7 @@ Rectangle {
                 tagsJson: JSON.stringify(t.tags ? t.tags : []),
                 collectionId: t.collection ? t.collection.id : "",
                 collectionName: t.collection ? t.collection.name : "",
+                collectionColor: (t.collection && t.collection.color) ? t.collection.color : "",
                 // Expansion lives in the model, not the delegate: ListView
                 // recycles delegates, so a flag held there would jump to
                 // whichever row scrolled into that slot. Rebuilding the model
@@ -1260,6 +1332,7 @@ Rectangle {
             readonly property bool expandedRow: model.expanded === true
             readonly property string rowCollectionName: model.collectionName
             readonly property string rowCollectionId: model.collectionId
+            readonly property string rowCollectionColor: model.collectionColor
             readonly property int hiddenTagCount: taskRow.expandedRow
                 ? 0
                 : Math.max(0, taskRow.rowTags.length - taskRow.maxCollapsedTags)
@@ -1379,7 +1452,14 @@ Rectangle {
                                 visible: taskRow.rowCollectionName.length > 0
                                          && root.viewCollections.length !== 1
                                 text: taskRow.rowCollectionName
-                                colored: false
+                                // Coloured only when the server actually
+                                // published one: an invented colour would
+                                // compete with the tag palette for no reason.
+                                colored: root.displayColor
+                                         && taskRow.rowCollectionColor.length > 0
+                                accent: taskRow.rowCollectionColor.length > 0
+                                        ? taskRow.rowCollectionColor
+                                        : "#303030"
                                 muted: taskRow.rowCompleted
 
                                 MouseArea {
@@ -1812,10 +1892,19 @@ Rectangle {
                 Repeater {
                     model: calendarsModel
 
+                    // Multi-select: every ticked collection is synced. Which
+                    // ones are *shown* is a filter on the main screen, and which
+                    // one new tasks go to is the create row's target -- three
+                    // separate questions that used to be one setting.
                     delegate: Rectangle {
+                        id: calendarOption
+                        required property string display_name
+                        required property string href
+                        readonly property bool synced:
+                            root.syncedHrefs.indexOf(href) !== -1
                         width: parent.width
                         height: 60
-                        color: model.href === root.selectedCalendarHref ? "black" : "white"
+                        color: synced ? "black" : "white"
                         border.color: "black"
                         border.width: 2
 
@@ -1823,17 +1912,16 @@ Rectangle {
                             anchors.left: parent.left
                             anchors.leftMargin: 12
                             anchors.verticalCenter: parent.verticalCenter
-                            text: model.display_name
+                            text: (calendarOption.synced ? "✓  " : "    ")
+                                  + calendarOption.display_name
                             font.pixelSize: 22
-                            color: model.href === root.selectedCalendarHref ? "white" : "black"
+                            color: calendarOption.synced ? "white" : "black"
                         }
 
                         MouseArea {
                             anchors.fill: parent
-                            onClicked: {
-                                root.selectedCalendar = model.display_name
-                                root.selectedCalendarHref = model.href
-                            }
+                            onClicked: root.toggleSynced(calendarOption.href,
+                                                         calendarOption.display_name)
                         }
                     }
                 }
@@ -1984,7 +2072,7 @@ Rectangle {
                     id: saveBtn
                     property bool active: settingsUrl.text.trim().length > 0
                                           && settingsUser.text.trim().length > 0
-                                          && root.selectedCalendarHref.length > 0
+                                          && root.syncedHrefs.length > 0
                                           && !root.needsDiscover
                     width: 200
                     height: 72
@@ -2023,6 +2111,58 @@ Rectangle {
                     MouseArea {
                         anchors.fill: parent
                         onClicked: root.settingsOpen = false
+                    }
+                }
+            }
+
+            // Two-step confirm, mirroring the task-delete idiom: the ordinary
+            // Save above is never destructive, and only this button -- which
+            // exists only after the backend has said what would be lost --
+            // carries the discard flag.
+            Row {
+                visible: root.settingsDiscardArmed
+                spacing: 16
+
+                Rectangle {
+                    width: 340
+                    height: 72
+                    color: "white"
+                    border.color: "#c0392b"
+                    border.width: 3
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Discard " + root.settingsPendingCount + " and save"
+                        font.pixelSize: 22
+                        color: "#c0392b"
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: root.saveSettings(true)
+                    }
+                }
+
+                Rectangle {
+                    width: 240
+                    height: 72
+                    color: "white"
+                    border.color: "black"
+                    border.width: 3
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Keep them"
+                        font.pixelSize: 22
+                        color: "black"
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            root.settingsDiscardArmed = false
+                            settingsStatus.text = "Kept. Tap Sync to send them, then change the list."
+                        }
                     }
                 }
             }
