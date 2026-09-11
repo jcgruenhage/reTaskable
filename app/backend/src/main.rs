@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 mod config;
 mod db;
+mod device;
 mod diagnostics;
 mod nextcloud;
 mod queue;
@@ -411,9 +412,28 @@ impl AppLoadBackend for Backend {
 
 fn list_sources(db: &Connection) -> anyhow::Result<String> {
     let active = active_list_href(db)?;
+    // Display capability rides along here rather than in the per-refresh task
+    // envelope: it is a property of the device, not of the list, so the UI only
+    // needs it on the startup call that already populates the list strip.
+    let color_mode = config::load_optional()?
+        .map(|cfg| cfg.ui.color)
+        .unwrap_or_else(|| "auto".to_string());
+    let display = device::capability(&color_mode);
+    diagnostics::record(&format!(
+        "display color={} source={} model={}",
+        display.color,
+        display.source,
+        if display.model.is_empty() {
+            "(unreadable)"
+        } else {
+            display.model.as_str()
+        }
+    ));
     Ok(serde_json::json!({
         "active": active,
         "sources": db::list_calendars(db)?,
+        "color": display.color,
+        "device": display.model,
     })
     .to_string())
 }
@@ -847,6 +867,7 @@ mod tests {
     fn cfg(base_url: &str, calendar: Option<&str>) -> config::Config {
         config::Config {
             active_list: None,
+            ui: config::UiConfig::default(),
             caldav: config::CaldavConfig {
                 provider: "generic".to_string(),
                 base_url: base_url.to_string(),
@@ -2196,6 +2217,10 @@ fn save_config_inner(db: &mut Connection, payload: &str) -> anyhow::Result<()> {
 
     let cfg = config::Config {
         active_list,
+        // Settings rebuilds the account section from the submitted form, so
+        // anything it does not own has to be carried across explicitly or a
+        // hand-edited `[ui] color` would be silently reset on every save.
+        ui: old.as_ref().map(|c| c.ui.clone()).unwrap_or_default(),
         caldav: config::CaldavConfig {
             provider,
             base_url,

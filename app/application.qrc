@@ -2,5 +2,6 @@
     <qresource>
         <file>ui/Main.qml</file>
         <file>ui/DueField.qml</file>
+        <file>ui/Pill.qml</file>
     </qresource>
 </RCC>

@@ -15,6 +15,8 @@ pub struct Config {
     /// callers then fall back to the configured calendar name until the next save.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_list: Option<String>,
+    #[serde(default)]
+    pub ui: UiConfig,
     /// `nextcloud` is accepted as a read-only compatibility alias for v1.0.x.
     #[serde(alias = "nextcloud")]
     pub caldav: CaldavConfig,
@@ -24,7 +26,29 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             active_list: Some(LOCAL_LIST_ID.to_string()),
+            ui: UiConfig::default(),
             caldav: CaldavConfig::default(),
+        }
+    }
+}
+
+fn default_color_mode() -> String {
+    "auto".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UiConfig {
+    /// `auto` | `on` | `off`. `auto` colors pills only on a display that can
+    /// render color; the other two override the probe in either direction, for
+    /// a device the probe doesn't recognize.
+    #[serde(default = "default_color_mode")]
+    pub color: String,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            color: default_color_mode(),
         }
     }
 }
@@ -165,6 +189,7 @@ mod tests {
                 calendar_href: Some("https://nc.example.com/tasks/".into()),
                 calendar: Some("Personal".to_string()),
             },
+            ..Default::default()
         };
         save_to(&path, &cfg).expect("save");
         let parsed: Config =
@@ -190,6 +215,7 @@ mod tests {
                 calendar_href: None,
                 calendar: None,
             },
+            ..Default::default()
         };
         save_to(&path, &cfg).expect("save");
         let parsed: Config =
@@ -220,5 +246,6 @@ calendar = "Tasks"
         assert_eq!(active_list(&parsed), Some(LOCAL_LIST_ID));
         assert_eq!(parsed.caldav.provider, "generic");
         assert!(!has_remote(&parsed));
+        assert_eq!(parsed.ui.color, "auto");
     }
 }

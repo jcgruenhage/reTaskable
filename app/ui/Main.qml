@@ -59,6 +59,10 @@ Rectangle {
     property string selectedCalendarHref: ""
     property string activeListId: "local://default"
     property string activeListName: "On This reMarkable"
+    // Whether pills may use color. Resolved by the backend display probe and
+    // delivered with the source list; false until then, so the first paint is
+    // the monochrome fallback rather than a wrong-colored flash.
+    property bool displayColor: false
     property string remoteDestinationId: ""
     // True when the server URL/username changed since the last successful
     // calendar discovery — Save is blocked until the user re-Tests, so we never
@@ -198,6 +202,7 @@ Rectangle {
         }
         sourcesModel.clear()
         root.activeListId = data.active ? data.active : "local://default"
+        root.displayColor = data.color === true
         root.remoteDestinationId = ""
         var sources = data.sources || []
         for (var i = 0; i < sources.length; i++) {
@@ -558,6 +563,43 @@ Rectangle {
             }
         }
         return out
+    }
+
+    // Classify a raw DUE token against the current date, for pill accenting:
+    // "overdue", "today", or "" (later, or unparseable). An all-day token is
+    // overdue only once the day itself has passed, so a task due today never
+    // reads as late; a timed token on today's date can.
+    function dueUrgency(raw) {
+        if (!raw || raw.length < 8) return ""
+        var s = "" + raw
+        if (s.charAt(s.length - 1) === "Z") s = s.substring(0, s.length - 1)
+        var y = parseInt(s.substring(0, 4), 10)
+        var mo = parseInt(s.substring(4, 6), 10)
+        var d = parseInt(s.substring(6, 8), 10)
+        if (isNaN(y) || isNaN(mo) || isNaN(d)) return ""
+        var now = new Date()
+        var today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+        var dueDay = new Date(y, mo - 1, d)
+        if (dueDay.getTime() > today.getTime()) return ""
+        if (dueDay.getTime() < today.getTime()) return "overdue"
+        if (s.indexOf("T") === 8 && s.length >= 13) {
+            var hh = parseInt(s.substring(9, 11), 10)
+            var mm = parseInt(s.substring(11, 13), 10)
+            if (!isNaN(hh) && !isNaN(mm)
+                    && new Date(y, mo - 1, d, hh, mm).getTime() < now.getTime()) {
+                return "overdue"
+            }
+        }
+        return "today"
+    }
+
+    // Amber matches the queued-op marker already used in the row, so "needs
+    // attention soon" is one color across the whole list.
+    function dueAccent(raw) {
+        var urgency = root.dueUrgency(raw)
+        if (urgency === "overdue") return "#c0392b"
+        if (urgency === "today") return "#b06000"
+        return "#3c5a78"
     }
 
     // ---- Header: title, status, and the essential controls ----
@@ -1016,13 +1058,42 @@ Rectangle {
                     width: parent.width - 20 - rowCheck.width - 42
                     spacing: 2
 
-                    Text {
+                    // Summary on the left, metadata pills flush to the row's
+                    // end. The summary elides into whatever the pills leave, so
+                    // a long title never pushes the due date off-screen.
+                    Item {
                         width: parent.width
-                        text: model.summary + (root.formatDue(model.due) ? "  (due " + root.formatDue(model.due) + ")" : "")
-                        font.pixelSize: 26
-                        elide: Text.ElideRight
-                        color: model.completed ? "#606060" : "black"
-                        font.strikeout: model.completed
+                        height: Math.max(summaryText.implicitHeight, rowPills.implicitHeight)
+
+                        Row {
+                            id: rowPills
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            spacing: 8
+
+                            Pill {
+                                visible: root.formatDue(model.due).length > 0
+                                text: root.formatDue(model.due)
+                                colored: root.displayColor
+                                accent: root.dueAccent(model.due)
+                                muted: model.completed
+                            }
+                        }
+
+                        Text {
+                            id: summaryText
+                            anchors.left: parent.left
+                            // An empty Row collapses to zero width, so a row
+                            // with no pills gives the summary the full span.
+                            anchors.right: rowPills.left
+                            anchors.rightMargin: rowPills.width > 0 ? 12 : 0
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: model.summary
+                            font.pixelSize: 26
+                            elide: Text.ElideRight
+                            color: model.completed ? "#606060" : "black"
+                            font.strikeout: model.completed
+                        }
                     }
 
                     // M13 note anchor: where this to-do was captured from. A Column
