@@ -1028,11 +1028,13 @@ fn apply_vtodo_mutations(ical: &str, mutations: &[(&str, Option<String>)]) -> St
     let mut out = String::new();
     let mut in_vtodo = false;
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut skipping_folded = false;
 
     for line in ical.split_inclusive('\n') {
         let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
 
         if in_vtodo && trimmed == "END:VTODO" {
+            skipping_folded = false;
             // Append any mutations we never matched on (new properties to add).
             for (key, value) in mutations.iter() {
                 if !seen.contains(key) {
@@ -1054,8 +1056,20 @@ fn apply_vtodo_mutations(ical: &str, mutations: &[(&str, Option<String>)]) -> St
         }
 
         if in_vtodo {
+            // RFC 5545 3.1 folding: a line beginning with a space or tab
+            // continues the one above it. When that property was just replaced
+            // or dropped, its continuations have to go with it -- otherwise the
+            // tail of the *old* value folds onto the new one and silently
+            // corrupts it.
+            if skipping_folded {
+                if line.starts_with(' ') || line.starts_with('\t') {
+                    continue;
+                }
+                skipping_folded = false;
+            }
             if let Some((key, value)) = matching_mutation(trimmed, mutations) {
                 seen.insert(key);
+                skipping_folded = true;
                 match value {
                     Some(v) => {
                         // Replace the existing line with the new value, preserving CRLF style.
@@ -2115,6 +2129,42 @@ mod tests {
         let mut marks = HashMap::new();
         marks.insert("uid-A".to_string(), true);
         assert_eq!(format_tasks_marked(&tasks, &marks), "! ☐ Buy milk");
+    }
+
+    #[test]
+    fn replacing_a_folded_property_discards_its_continuation_lines() {
+        // A server is free to fold any long value across lines. Replacing only
+        // the first line left the remainder behind, and because a continuation
+        // folds onto whatever precedes it, the tail of the *old* summary became
+        // part of the new one.
+        let ical = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:u1\r\n\
+                    SUMMARY:a summary long enough that the server \r\n split it across lines\r\n\
+                    STATUS:NEEDS-ACTION\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let out = replace_summary(ical, "short summary");
+
+        assert!(out.contains("SUMMARY:short summary"));
+        assert!(
+            !out.contains("split it across lines"),
+            "the old value's continuation must not survive:\n{out}"
+        );
+        // Properties either side of the replaced one are untouched.
+        assert!(out.contains("UID:u1"));
+        assert!(out.contains("STATUS:NEEDS-ACTION"));
+        assert!(out.contains("END:VTODO"));
+    }
+
+    #[test]
+    fn folding_of_other_properties_is_left_alone() {
+        // Only the replaced property's continuations are dropped; an unrelated
+        // folded value has to survive intact.
+        let ical = "BEGIN:VTODO\r\nUID:u1\r\nSUMMARY:old\r\n\
+                    DESCRIPTION:notes that are \r\n folded across lines\r\nEND:VTODO\r\n";
+        let out = replace_summary(ical, "new");
+        assert!(out.contains("SUMMARY:new"));
+        assert!(
+            out.contains(" folded across lines"),
+            "an unrelated folded value must be preserved:\n{out}"
+        );
     }
 
     #[test]
