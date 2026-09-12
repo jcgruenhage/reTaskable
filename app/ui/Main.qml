@@ -42,6 +42,12 @@ Rectangle {
     property string detailDueOriginal: ""
     property string detailSource: ""
     property string detailMark: ""
+    // Descriptions are fetched per task rather than carried on every row: they
+    // are only ever shown here, and putting one on each row would re-serialise
+    // all of them on every list refresh.
+    property string detailDescription: ""
+    property string detailDescriptionOriginal: ""
+    property bool detailDescriptionLoading: false
     // M15 jump-back: the source note's machine anchor for the open task.
     property string detailDoc: ""
     property string detailPage: ""
@@ -117,6 +123,10 @@ Rectangle {
             }
             if (type === 114) {
                 root.applyToggleResult(contents)
+                return
+            }
+            if (type === 128) {
+                root.applyDescription(contents)
                 return
             }
             if (type === 105 || type === 108 || type === 119 || type === 120) {
@@ -498,6 +508,13 @@ Rectangle {
         root.detailDoc = t.doc ? t.doc : ""
         root.detailPage = t.page ? t.page : ""
         root.detailDeleteArmed = false
+        // Cleared first so the previous task's notes can't flash up under the
+        // new one while the reply is in flight.
+        root.detailDescription = ""
+        root.detailDescriptionOriginal = ""
+        detailDescriptionInput.text = ""
+        root.detailDescriptionLoading = true
+        endpoint.sendMessage(28, t.uid)
         detailSummaryInput.text = t.summary
         // M16: prefill the due editor from the row, and record the normalized
         // token so Save can detect a real due change.
@@ -509,6 +526,24 @@ Rectangle {
     // Close the detail dialog, releasing focus from the summary editor and
     // dismissing the virtual keyboard (the TextArea raised it on focus; nothing
     // else takes it down on the way back to the list).
+    // Reply to MSG 28. Ignored unless it is for the task still on screen: a
+    // slow reply for a dialog the user already closed must not overwrite what
+    // they are looking at now.
+    function applyDescription(jsonText) {
+        var d
+        try {
+            d = JSON.parse(jsonText)
+        } catch (e) {
+            root.detailDescriptionLoading = false
+            return
+        }
+        if (!d.uid || d.uid !== root.detailUid) return
+        root.detailDescription = d.description ? d.description : ""
+        root.detailDescriptionOriginal = root.detailDescription
+        detailDescriptionInput.text = root.detailDescription
+        root.detailDescriptionLoading = false
+    }
+
     function closeDetail() {
         detailSummaryInput.focus = false
         Qt.inputMethod.hide()
@@ -1622,6 +1657,35 @@ Rectangle {
 
             DueField { id: detailDueField; width: parent.width }
 
+            Text {
+                text: root.detailDescriptionLoading ? "Notes (loading…)" : "Notes"
+                font.pixelSize: 22
+                color: "#303030"
+            }
+
+            // Multi-line, because a description routinely is. No live binding
+            // back to the model: it is saved explicitly with the rest of the
+            // dialog, like the summary and the due date.
+            Rectangle {
+                width: parent.width
+                height: 240
+                color: "white"
+                border.color: "black"
+                border.width: 3
+
+                TextArea {
+                    id: detailDescriptionInput
+                    anchors.fill: parent
+                    anchors.margins: 8
+                    font.pixelSize: 22
+                    color: "black"
+                    wrapMode: TextArea.Wrap
+                    placeholderText: "Notes for this task"
+                    placeholderTextColor: "#606060"
+                    enabled: !root.detailDescriptionLoading
+                }
+            }
+
             Row {
                 spacing: 16
 
@@ -1631,7 +1695,8 @@ Rectangle {
                     // either the summary text or the due token (vs what we opened with).
                     property bool active: detailSummaryInput.text.trim().length > 0
                                           && (detailSummaryInput.text.trim() !== root.detailSummary
-                                              || detailDueField.token !== root.detailDueOriginal)
+                                              || detailDueField.token !== root.detailDueOriginal
+                                              || detailDescriptionInput.text !== root.detailDescriptionOriginal)
                     width: 240
                     height: 72
                     color: detailSaveBtn.active ? "white" : "#dddddd"
@@ -1653,7 +1718,8 @@ Rectangle {
                             endpoint.sendMessage(19, JSON.stringify({
                                 uid: root.detailUid,
                                 summary: detailSummaryInput.text.trim(),
-                                due: detailDueField.token
+                                due: detailDueField.token,
+                                description: detailDescriptionInput.text
                             }))
                             root.closeDetail()
                         }

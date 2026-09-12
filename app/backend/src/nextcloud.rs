@@ -1257,6 +1257,66 @@ pub fn extract_source_label(ical_text: &str) -> Option<String> {
 /// UUID (`X-RETASKABLE-SOURCE-DOC`) and page key (`X-RETASKABLE-SOURCE-PAGE`, e.g.
 /// `idx:0`). Unlike the LABEL these are not RFC 5545 text-escaped (a UUID / `idx:N`
 /// has no specials), so no unescape — just unfold + prefix-strip + trim.
+/// Read the VTODO `DESCRIPTION`, unfolded and unescaped.
+///
+/// Returns `None` when absent or empty, so callers can treat "no notes" and "an
+/// empty notes field" identically -- the detail view has no use for the
+/// distinction, and round-tripping it would only produce empty properties.
+pub fn extract_description(ical_text: &str) -> Option<String> {
+    let unfolded = unfold_ical(ical_text);
+    for line in unfolded.lines() {
+        let Some(rest) = line.strip_prefix("DESCRIPTION") else {
+            continue;
+        };
+        // Parameters may sit between the name and the value's colon, and a
+        // quoted parameter value may contain one, so track quoting rather than
+        // taking the first colon in the line.
+        let mut in_quotes = false;
+        for (idx, ch) in rest.char_indices() {
+            match ch {
+                '"' => in_quotes = !in_quotes,
+                ':' if !in_quotes => {
+                    let value = unescape_ical_text(&rest[idx + 1..]);
+                    let trimmed = value.trim();
+                    return if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    };
+                }
+                ';' => {}
+                // Anything else in first position means a different property
+                // that merely starts with the same letters.
+                _ if idx == 0 => break,
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Set or clear the VTODO `DESCRIPTION`.
+///
+/// An empty or whitespace-only value drops the property rather than writing an
+/// empty one, which is what other CalDAV clients show for "no notes".
+pub fn set_description(ical_text: &str, description: &str) -> String {
+    let ical_text = ensure_crlf(ical_text);
+    let now = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let value = if description.trim().is_empty() {
+        None
+    } else {
+        Some(escape_ical_text(description.trim()))
+    };
+    apply_vtodo_mutations(
+        &ical_text,
+        &[
+            ("DESCRIPTION", value),
+            ("DTSTAMP", Some(now.clone())),
+            ("LAST-MODIFIED", Some(now)),
+        ],
+    )
+}
+
 pub fn extract_source_doc(ical_text: &str) -> Option<String> {
     extract_xprop(ical_text, "X-RETASKABLE-SOURCE-DOC:")
 }
@@ -1573,7 +1633,8 @@ fn propstat_is_ok(propstat: &roxmltree::Node) -> bool {
 mod tests {
     use super::{
         discover_calendars, due_property_line, ensure_crlf, escape_ical_text, extract_source_doc,
-        extract_source_label, extract_source_page, filter_for_display, format_tasks_json, get_task,
+        extract_description, extract_source_label, extract_source_page, filter_for_display,
+        format_tasks_json, get_task, set_description,
         is_icloud_caldav_host, parse_sync_response, redirect_allowed, replace_summary, set_due,
         sync_collection_unsupported, unescape_ical_text,
     };
@@ -2132,6 +2193,85 @@ mod tests {
     }
 
     #[test]
+    fn description_roundtrips_through_folding_and_escaping() {
+        let ical = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:u1\r\nSUMMARY:Tiles\r\n\
+                    DESCRIPTION:Ask about grout\\, then measure\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        assert_eq!(
+            extract_description(ical).as_deref(),
+            Some("Ask about grout, then measure"),
+            "an escaped comma is part of the text, not a separator"
+        );
+
+        // A server-folded value has to be read whole.
+        let folded = "BEGIN:VTODO\r\nDESCRIPTION:the first part \r\n and the second\r\nEND:VTODO\r\n";
+        assert_eq!(
+            extract_description(folded).as_deref(),
+            Some("the first part and the second")
+        );
+
+        // Absent and empty both read as "no notes".
+        assert_eq!(extract_description("BEGIN:VTODO\r\nEND:VTODO\r\n"), None);
+        assert_eq!(
+            extract_description("BEGIN:VTODO\r\nDESCRIPTION:\r\nEND:VTODO\r\n"),
+            None
+        );
+        // A property that merely starts with the same letters is not it.
+        assert_eq!(
+            extract_description("BEGIN:VTODO\r\nDESCRIPTION-X:nope\r\nEND:VTODO\r\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn setting_a_description_replaces_the_whole_folded_value() {
+        // The regression this guards: replacing a folded property used to leave
+        // its continuation lines behind, so the tail of the *old* value folded
+        // onto the new one and silently corrupted it.
+        let ical = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:u1\r\nSUMMARY:Tiles\r\n\
+                    DESCRIPTION:old text that was \r\n folded across lines\r\n\
+                    STATUS:NEEDS-ACTION\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let out = set_description(ical, "brand new notes");
+        assert_eq!(extract_description(&out).as_deref(), Some("brand new notes"));
+        assert!(
+            !out.contains("folded across lines"),
+            "no orphaned continuation lines may survive:\n{out}"
+        );
+        // Untouched properties stay put.
+        assert!(out.contains("SUMMARY:Tiles"));
+        assert!(out.contains("STATUS:NEEDS-ACTION"));
+    }
+
+    #[test]
+    fn an_empty_description_drops_the_property_entirely() {
+        let ical = "BEGIN:VTODO\r\nUID:u1\r\nDESCRIPTION:something\r\nEND:VTODO\r\n";
+        let cleared = set_description(ical, "   ");
+        assert_eq!(extract_description(&cleared), None);
+        assert!(
+            !cleared.contains("DESCRIPTION"),
+            "an empty property is worse than none:\n{cleared}"
+        );
+    }
+
+    #[test]
+    fn a_description_is_added_when_the_task_had_none() {
+        let ical = "BEGIN:VTODO\r\nUID:u1\r\nSUMMARY:Tiles\r\nEND:VTODO\r\n";
+        let out = set_description(ical, "new notes");
+        assert_eq!(extract_description(&out).as_deref(), Some("new notes"));
+    }
+
+    #[test]
+    fn multi_line_descriptions_survive_the_round_trip() {
+        let ical = "BEGIN:VTODO\r\nUID:u1\r\nEND:VTODO\r\n";
+        let out = set_description(ical, "first line\nsecond line");
+        // Newlines are escaped on the wire, per RFC 5545.
+        assert!(out.contains("\\n"), "newline must be escaped:\n{out}");
+        assert_eq!(
+            extract_description(&out).as_deref(),
+            Some("first line\nsecond line")
+        );
+    }
+
+    #[test]
     fn replacing_a_folded_property_discards_its_continuation_lines() {
         // A server is free to fold any long value across lines. Replacing only
         // the first line left the remainder behind, and because a continuation
@@ -2166,7 +2306,6 @@ mod tests {
             "an unrelated folded value must be preserved:\n{out}"
         );
     }
-
     #[test]
     fn format_tasks_json_empty_renders_empty_envelope() {
         let out = format_tasks_json(

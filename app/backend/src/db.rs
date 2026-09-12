@@ -621,6 +621,7 @@ pub fn enqueue_edit(
     uid: &str,
     new_summary: &str,
     due: Option<&str>,
+    description: Option<&str>,
 ) -> Result<i64> {
     let tx = conn.unchecked_transaction()?;
 
@@ -649,6 +650,15 @@ pub fn enqueue_edit(
         None => (summarised, existing_due),
     };
 
+    // Same present/absent contract as `due`: a present value sets or clears the
+    // description, absent leaves whatever the body already carries. The cache
+    // keeps no description column -- the detail view reads it from ical_text on
+    // demand, so there is nothing else to keep in step.
+    let new_ical = match description {
+        Some(text) => crate::nextcloud::set_description(&new_ical, text),
+        None => new_ical,
+    };
+
     let affected = tx.execute(
         "UPDATE task SET ical_text = ?1, summary = ?2, due = ?3 \
          WHERE calendar_href = ?4 AND href = ?5",
@@ -666,6 +676,9 @@ pub fn enqueue_edit(
         // Present key (even when "") tells the queue to set/clear DUE on flush;
         // absent means "don't touch it" (pre-M16 ops, or summary-only edits).
         payload_obj.insert("due".into(), serde_json::json!(token));
+    }
+    if let Some(text) = description {
+        payload_obj.insert("description".into(), serde_json::json!(text));
     }
     let payload = serde_json::to_string(&serde_json::Value::Object(payload_obj))?;
     let enqueued_at = unix_secs_now();
@@ -736,8 +749,9 @@ pub fn edit_local(
     uid: &str,
     summary: &str,
     due: Option<&str>,
+    description: Option<&str>,
 ) -> Result<()> {
-    let op_id = enqueue_edit(conn, LOCAL_LIST_ID, uid, summary, due)?;
+    let op_id = enqueue_edit(conn, LOCAL_LIST_ID, uid, summary, due, description)?;
     delete_pending_op(conn, op_id)
 }
 
@@ -1089,6 +1103,25 @@ pub fn get_pending_op_by_id(conn: &Connection, id: i64) -> Result<Option<Pending
 /// `CachedTask` shape for callers that need summary/status (e.g.
 /// the conflict-resolution preview). Does NOT filter on
 /// `pending_delete` — callers must decide.
+/// The cached iCalendar body for a UID, regardless of collection.
+///
+/// Collection-agnostic on purpose: the detail view reads a description for the
+/// row the user tapped, and the row already knows which task it is. Ordering by
+/// `calendar_href` makes a cross-collection duplicate UID resolve the same way
+/// every time rather than arbitrarily.
+pub fn get_ical_by_uid(conn: &Connection, uid: &str) -> Result<Option<String>> {
+    let text = conn
+        .query_row(
+            "SELECT ical_text FROM task \
+              WHERE uid = ?1 AND pending_delete = 0 \
+              ORDER BY calendar_href LIMIT 1",
+            params![uid],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(text)
+}
+
 pub fn get_cached_task_by_uid(
     conn: &Connection,
     calendar_href: &str,
@@ -2150,7 +2183,7 @@ mod tests {
         .unwrap();
 
         let op_id =
-            enqueue_edit(&mut conn, "/cal/", "uid-e", "New summary", None).expect("enqueue");
+            enqueue_edit(&mut conn, "/cal/", "uid-e", "New summary", None, None).expect("enqueue");
         assert!(op_id > 0);
 
         let (summary, new_ical): (String, String) = conn
@@ -2196,7 +2229,7 @@ mod tests {
 
         // Summary contains a double-quote and a newline.
         let weird = "He said \"hi\"\nand left";
-        enqueue_edit(&mut conn, "/cal/", "uid-q", weird, None).unwrap();
+        enqueue_edit(&mut conn, "/cal/", "uid-q", weird, None, None).unwrap();
         let payload: String = conn
             .query_row(
                 "SELECT payload FROM pending_op WHERE target_uid = 'uid-q'",
@@ -2288,7 +2321,7 @@ mod tests {
         .unwrap();
 
         // Set a due.
-        enqueue_edit(&mut conn, "/cal/", "uid-ed", "Task", Some("20260101")).unwrap();
+        enqueue_edit(&mut conn, "/cal/", "uid-ed", "Task", Some("20260101"), None).unwrap();
         let (ical1, due1): (String, Option<String>) = conn
             .query_row(
                 "SELECT ical_text, due FROM task WHERE uid = 'uid-ed'",
@@ -2310,7 +2343,7 @@ mod tests {
         assert_eq!(parsed["due"], "20260101");
 
         // Clear it (empty token).
-        enqueue_edit(&mut conn, "/cal/", "uid-ed", "Task", Some("")).unwrap();
+        enqueue_edit(&mut conn, "/cal/", "uid-ed", "Task", Some(""), None).unwrap();
         let (ical2, due2): (String, Option<String>) = conn
             .query_row(
                 "SELECT ical_text, due FROM task WHERE uid = 'uid-ed'",
@@ -2322,8 +2355,8 @@ mod tests {
         assert_eq!(due2, None);
 
         // Summary-only edit (due = None) preserves whatever DUE exists.
-        enqueue_edit(&mut conn, "/cal/", "uid-ed", "Task", Some("20260202")).unwrap();
-        enqueue_edit(&mut conn, "/cal/", "uid-ed", "Renamed", None).unwrap();
+        enqueue_edit(&mut conn, "/cal/", "uid-ed", "Task", Some("20260202"), None).unwrap();
+        enqueue_edit(&mut conn, "/cal/", "uid-ed", "Renamed", None, None).unwrap();
         let (ical3, due3): (String, Option<String>) = conn
             .query_row(
                 "SELECT ical_text, due FROM task WHERE uid = 'uid-ed'",
@@ -2345,7 +2378,7 @@ mod tests {
             [],
         )
         .unwrap();
-        let err = enqueue_edit(&mut conn, "/cal/", "uid-missing", "anything", None);
+        let err = enqueue_edit(&mut conn, "/cal/", "uid-missing", "anything", None, None);
         assert!(err.is_err());
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0))
@@ -2868,7 +2901,7 @@ mod tests {
             0
         );
         toggle_local(&mut conn, "local-1").unwrap();
-        edit_local(&mut conn, "local-1", "Buy oat milk", Some("")).unwrap();
+        edit_local(&mut conn, "local-1", "Buy oat milk", Some(""), None).unwrap();
         let task = get_cached_task_by_uid(&conn, LOCAL_LIST_ID, "local-1")
             .unwrap()
             .unwrap();
